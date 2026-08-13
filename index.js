@@ -29,7 +29,7 @@
     // v1 备份（含编号的旧 content + 预置款式）一次性清除，避免 9 款默认衣服回灌。
     const STORAGE_KEY_BACKUP_V1 = 'standInHoneyMoonSync_backup_v1';
     const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
-    const SETTINGS_VERSION = '1.6.5';
+    const SETTINGS_VERSION = '1.6.6';
 
     // 诊断记录（设置面板自检显示，不需要 F12 控制台）
     const diag = {
@@ -650,7 +650,8 @@
         // 真落盘：写入服务器世界书（云平台角色世界书即服务器书；本地无目标书自动跳过）。
         // fire-and-forget，不阻塞对话；结果进 diag，失败静默（本地备份兜底）。
         // 这是"买了衣服却没进已购库"的根治：以前只写内存/空壳保存接口，服务器永远没收到。
-        syncServerPurchased(content, purchasedIds).then((r) => {
+        // openEditor=false：自动链路不把编辑台顶出来打断聊天，只刷新缓存/列表；编辑台开着这本书才会即时重绘。
+        syncServerPurchased(content, purchasedIds, false).then((r) => {
             diag.serverWriteResult = r.lines.join('\n');
             if (r.ok) {
                 log('已购库已写入服务器世界书（' + added.join('、') + '）');
@@ -1231,24 +1232,26 @@
     }
 
     // 通知前端世界书缓存与编辑台刷新（让界面即时显示，不用手动刷新页面）。
-    // Chloe 平台自己保存时会 worldInfoCache.set + emit WORLDINFO_UPDATED；
+    // Chloe 平台自己的保存会 worldInfoCache.set + emit WORLDINFO_UPDATED；
     // 扩展直接 POST edit 绕过了这步，这里补上：缓存更新 + 事件 + 编辑器重渲染，全防御式。
-    function notifyWorldInfoRefreshed(bookName, book) {
+    // openEditor=true：强制把书载进编辑台（手动按钮场景，用户要看结果）；
+    // openEditor=false：仅当编辑台正开这本书才刷新（自动链路，不打断聊天）。
+    async function notifyWorldInfoRefreshed(bookName, book, openEditor) {
         const actions = [];
         try {
             const ctx = getContext();
-            // ① 走平台自己的 saveWorldInfo(name, data)：更新 worldInfoCache + emit WORLDINFO_UPDATED
-            //    若是真身，编辑器/缓存刷新；若是空壳，无害（服务器文件已由扩展写好）。
+            // ① 平台缓存更新 + 事件（保存为整本书对象；平台会更新 worldInfoCache 并触发自身事件）
             if (bookName && book && ctx && typeof ctx.saveWorldInfo === 'function') {
-                try { ctx.saveWorldInfo(bookName, book); actions.push('saveWorldInfo(' + bookName + ')'); } catch (e) { /* ignore */ }
+                try { ctx.saveWorldInfo(bookName, book); actions.push('saveWorldInfo'); } catch (e) { /* ignore */ }
             }
-            // ② 编辑器重渲染（编辑台若正开着这本书会立即显示新条目）
-            if (ctx && typeof ctx.reloadWorldInfoEditor === 'function') {
-                try { ctx.reloadWorldInfoEditor(); actions.push('reloadWorldInfoEditor'); } catch (e) { /* ignore */ }
-            }
-            // ③ 世界书列表刷新（新增/改名可见）
+            // ② 世界书列表刷新：reloadEditor 依赖 world_names，必须先等它填充完成
             if (ctx && typeof ctx.updateWorldInfoList === 'function') {
-                try { ctx.updateWorldInfoList(); actions.push('updateWorldInfoList'); } catch (e) { /* ignore */ }
+                try { await ctx.updateWorldInfoList(); actions.push('updateWorldInfoList'); } catch (e) { /* ignore */ }
+            }
+            // ③ 编辑台重载：reloadEditor(文件名, loadIfNotSelected) 必须传书名才有意义
+            //    （无参调用时内部 world_names.indexOf(undefined) = -1，直接 no-op——之前就死在这）
+            if (bookName && ctx && typeof ctx.reloadWorldInfoEditor === 'function') {
+                try { ctx.reloadWorldInfoEditor(bookName, openEditor === true); actions.push('reloadEditor(' + bookName + ')'); } catch (e) { /* ignore */ }
             }
             // ④ 兜底 emit 平台事件（若无监听也无害）
             const es = (window.SillyTavern && window.SillyTavern.eventSource) || window.eventSource;
@@ -1262,8 +1265,9 @@
 
     // 把「已购衣物库」content 写入服务器世界书（POST get → 改 entries → POST edit）。
     // 与世界书编辑台同一套 API，直接连服务器书——老大说的"选世界书连上去"就这么实现。
+    // openEditor=true：写完把书载进编辑台（手动按钮，即时显示）；false/缺省：不打断聊天（自动链路）。
     // 返回 { ok, lines }；不弹 toast，结果进 diag，失败静默（本地备份兜底）。
-    async function syncServerPurchased(content, ids) {
+    async function syncServerPurchased(content, ids, openEditor) {
         const lines = [];
         const n = Array.isArray(ids) ? ids.length : 0;
         lines.push('已购库 content ' + (content ? content.length : 0) + ' 字（无编号），' + n + ' 款');
@@ -1307,7 +1311,7 @@
             const save = await serverApi('POST', 'edit', { name: bookName, data: book });
             lines.push('edit 落盘: HTTP ' + save.status);
             // 刷新前端世界书缓存/编辑台（即时显示，不用手动刷新页面）
-            const refresh = notifyWorldInfoRefreshed(bookName, book);
+            const refresh = await notifyWorldInfoRefreshed(bookName, book, openEditor);
             if (refresh.length) lines.push('已通知前端刷新: ' + refresh.join(' + '));
             else lines.push('（未找到前端刷新接口，编辑台如未更新需刷新页面）');
             // 回读验证：已购库 content 不含编号（编号在记账层），用内容比对判断落盘
@@ -1344,7 +1348,8 @@
             const content = (b && b.content) || (pur && pur.content);
             if (!content) { lines.push('没有已购库内容（先买一件，或点立即同步）'); writeServerResult(lines); return; }
             const ids = (b && Array.isArray(b.purchasedIds)) ? b.purchasedIds : [];
-            const r = await syncServerPurchased(content, ids);
+            // openEditor=true：按钮场景，写完把书载进编辑台即时显示
+            const r = await syncServerPurchased(content, ids, true);
             lines.push(...r.lines);
             if (!r.ok) lines.push('写入未完成——详见上方结果');
         } catch (e) {
