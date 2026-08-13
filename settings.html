@@ -1,0 +1,60 @@
+<div
+    class="stand-in-honeymoon-sync-settings extension_settings"
+    data-extension-name="stand-in-honeymoon-sync"
+>
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b><i class="fa-solid fa-shirt"></i> 已购衣物同步</b>
+            <div
+                class="inline-drawer-icon fa-solid fa-circle-chevron-down down"
+            ></div>
+        </div>
+        <div class="inline-drawer-content">
+            <div class="description_text">
+                对话中购买「可购买衣物库」的衣物后，自动追加到「已购衣物库」世界书条目，杜绝"买了但没进清单"。
+            </div>
+
+            <div class="setting_item">
+                <span>启用已购衣物同步</span>
+                <div class="SillyTavernSwitch">
+                    <input
+                        id="sihs-enabled-checkbox"
+                        type="checkbox"
+                    />
+                    <div class="SillyTavernSlider"></div>
+                </div>
+            </div>
+            <div class="description_text">
+                关闭后扩展不再监听购买场景（世界书里已添加的条目不会删除）。
+            </div>
+
+            <div
+                id="sihs-status-display"
+                class="description_text"
+                style="margin-top: 8px"
+            ></div>
+
+            <div class="button-group">
+                <button
+                    id="sihs-force-sync"
+                    class="menu_button wide_button"
+                >
+                    <i class="fa-solid fa-arrows-rotate"></i> 立即同步当前聊天
+                </button>
+                <button
+                    id="sihs-open-github"
+                    class="menu_button wide_button"
+                >
+                    <i class="fa-brands fa-github"></i> 查看源码
+                </button>
+            </div>
+
+            <div
+                class="description_text"
+                style="text-align: center; margin-top: 6px"
+            >
+                版本 <span id="sihs-version">1.1.0</span>
+            </div>
+        </div>
+    </div>
+</div>
