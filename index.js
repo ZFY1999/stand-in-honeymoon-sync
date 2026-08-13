@@ -26,7 +26,7 @@
     // 已购库本地备份：云平台若保存不落盘，扩展每次加载从这恢复，保证模型能读到已购库
     const STORAGE_KEY_BACKUP = 'standInHoneyMoonSync_backup_v1';
     const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
-    const SETTINGS_VERSION = '1.3.2';
+    const SETTINGS_VERSION = '1.4.0';
 
     // 诊断记录（设置面板自检显示，不需要 F12 控制台）
     const diag = {
@@ -851,6 +851,11 @@
             $writeWi.addEventListener('click', writeWorldInfoNow);
         }
 
+        const $exportCard = panel.querySelector('#sihs-export-card');
+        if ($exportCard) {
+            $exportCard.addEventListener('click', exportCardNow);
+        }
+
         const $gh = panel.querySelector('#sihs-open-github');
         if ($gh) {
             $gh.addEventListener('click', () => {
@@ -1019,6 +1024,56 @@
                 }
             }
         } catch (e) { /* ignore */ }
+    }
+
+    // 导出角色卡（含最新已购衣物库）：平台保存不落盘，唯一可靠的"同步到服务器/编辑器"路径
+    // 就是"重新导入卡"。买完衣服点这个 → 下载一张完整 v3 卡 → 导入覆盖原角色 → 服务器就有最新已购库。
+    function exportCardNow() {
+        try {
+            const c = getContext();
+            if (!c) { showToast('warning', 'getContext 不可用'); return; }
+            const t = getTargetCharacter(c);
+            if (!t) { showToast('warning', '未找到目标角色'); return; }
+            const { cb } = resolveCharBook(t.char);
+            if (!cb) { showToast('error', '目标角色无世界书 data.character_book'); return; }
+            // 先把最近的聊天扫一遍（有购买则追加 + 写备份），保证导出的已购库是最新
+            try {
+                const chat = Array.isArray(c.chat) ? c.chat.slice(-8) : [];
+                handleMessages(chat);
+            } catch (e) { /* ignore */ }
+            // 从备份刷新已购库 content（备份总是最新落点）
+            const b = backupFor(charNameKey(t.char));
+            if (b && b.content) {
+                const pur = cb.entries.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
+                if (pur) {
+                    pur.content = b.content;
+                } else {
+                    const built = buildNewPurchasedEntry(t.char, b.content);
+                    if (built) cb.entries.push(built);
+                }
+            }
+            // 拼 v3 卡壳
+            const data = (t.char.data && typeof t.char.data === 'object') ? t.char.data : t.char;
+            data.character_book = cb;
+            const card = { spec: 'chara_card_v3', spec_version: '2.0', data };
+            const json = JSON.stringify(card, null, 2);
+            const blob = new Blob([json], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            let ts = '';
+            try { ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19); } catch (e) { ts = 'card'; }
+            a.href = url;
+            a.download = '代替蜜月_已购库' + ts + '.json';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ } }, 3000);
+            const n = (b && b.content) ? (b.content.match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) || []).length : 0;
+            showToast('info', '已导出角色卡（含已购衣物库 ' + n + ' 款）→ 去"导入角色"覆盖原角色');
+            log('导出角色卡：' + a.download + '（已购库 ' + n + ' 款）');
+        } catch (e) {
+            showToast('error', '导出异常：' + (e && e.message));
+        }
     }
 
     // --- 自检诊断（设置面板按钮，不需要 F12 控制台） ---
