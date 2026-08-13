@@ -11,7 +11,7 @@
         </div>
         <div class="inline-drawer-content">
             <div class="description_text">
-                对话中购买「可购买衣物库」的衣物后，自动追加到「已购衣物库」世界书条目，杜绝"买了但没进清单"。
+                对话中购买「可购买衣物库」的衣物后，自动追加到「已购衣物库」，并同步到服务器世界书。
             </div>
 
             <div class="setting_item">
@@ -25,7 +25,7 @@
                 </div>
             </div>
             <div class="description_text">
-                关闭后扩展不再监听购买场景（世界书里已添加的条目不会删除）。
+                关闭后不再监听购买场景（已添加的条目不会删除）。
             </div>
 
             <div
@@ -34,7 +34,18 @@
                 style="margin-top: 8px"
             ></div>
 
+            <div
+                style="margin-top: 10px; font-size: 12px; color: #8a8a8a; letter-spacing: 1px"
+            >
+                ▍日常操作
+            </div>
             <div class="button-group">
+                <button
+                    id="sihs-write-server"
+                    class="menu_button wide_button"
+                >
+                    <i class="fa-solid fa-cloud-arrow-up"></i> 同步已购库到服务器
+                </button>
                 <button
                     id="sihs-force-sync"
                     class="menu_button wide_button"
@@ -42,54 +53,65 @@
                     <i class="fa-solid fa-arrows-rotate"></i> 立即同步当前聊天
                 </button>
                 <button
-                    id="sihs-test-save"
-                    class="menu_button wide_button"
-                >
-                    <i class="fa-solid fa-floppy-disk"></i> 测试保存
-                </button>
-                <button
-                    id="sihs-write-worldinfo"
-                    class="menu_button wide_button"
-                >
-                    <i class="fa-solid fa-bullseye"></i> 写 worldInfo 落盘测试
-                </button>
-                <button
-                    id="sihs-write-server"
-                    class="menu_button wide_button"
-                >
-                    <i class="fa-solid fa-cloud-upload"></i> 已购库写入服务器世界书
-                </button>
-                <button
                     id="sihs-export-card"
                     class="menu_button wide_button"
                 >
                     <i class="fa-solid fa-file-export"></i> 导出角色卡（含已购库）
                 </button>
-                <button
-                    id="sihs-self-check"
-                    class="menu_button wide_button"
-                >
-                    <i class="fa-solid fa-stethoscope"></i> 运行自检
-                </button>
-                <button
-                    id="sihs-open-github"
-                    class="menu_button wide_button"
-                >
-                    <i class="fa-brands fa-github"></i> 查看源码
-                </button>
             </div>
+            <div class="description_text" style="font-size: 12px; color: #777; margin-top: 4px">
+                买完衣物：点「同步已购库到服务器」写入平台世界书；若那一步失败，用「导出角色卡」下载最新卡后重新导入覆盖。
+            </div>
+
+            <div
+                style="margin-top: 10px; font-size: 12px; color: #8a8a8a; letter-spacing: 1px"
+            >
+                ▍诊断 / 排查
+            </div>
+            <details>
+                <summary
+                    style="cursor: pointer; font-size: 12px; color: #8a8a8a; margin: 4px 0 6px"
+                >
+                    诊断与测试（故障时才需要）
+                </summary>
+                <div class="button-group">
+                    <button
+                        id="sihs-self-check"
+                        class="menu_button wide_button"
+                    >
+                        <i class="fa-solid fa-stethoscope"></i> 运行自检
+                    </button>
+                    <button
+                        id="sihs-write-worldinfo"
+                        class="menu_button wide_button"
+                    >
+                        <i class="fa-solid fa-flask"></i> 写 worldInfo 测试
+                    </button>
+                    <button
+                        id="sihs-test-save"
+                        class="menu_button wide_button"
+                    >
+                        <i class="fa-solid fa-floppy-disk"></i> 测试保存
+                    </button>
+                </div>
+            </details>
 
             <pre
                 id="sihs-diag-pre"
                 class="description_text"
-                style="display: none; white-space: pre-wrap; word-break: break-all; font-size: 12px; margin-top: 8px; max-height: 260px; overflow-y: auto;"
+                style="display: none; white-space: pre-wrap; word-break: break-all; font-size: 12px; margin-top: 8px; max-height: 320px; overflow-y: auto;"
             ></pre>
 
             <div
                 class="description_text"
-                style="text-align: center; margin-top: 6px"
+                style="text-align: center; margin-top: 8px; color: #999; font-size: 12px"
             >
-                版本 <span id="sihs-version">1.5.0</span>
+                版本 <span id="sihs-version"></span> · 由暮蝶维护 ·
+                <a
+                    id="sihs-open-github"
+                    href="javascript:void(0)"
+                    style="color: #4c8dff; text-decoration: none"
+                >源码</a>
             </div>
         </div>
     </div>
