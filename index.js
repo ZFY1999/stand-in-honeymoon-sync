@@ -26,7 +26,7 @@
     // 已购库本地备份：云平台若保存不落盘，扩展每次加载从这恢复，保证模型能读到已购库
     const STORAGE_KEY_BACKUP = 'standInHoneyMoonSync_backup_v1';
     const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
-    const SETTINGS_VERSION = '1.2.1';
+    const SETTINGS_VERSION = '1.2.2';
 
     // 诊断记录（设置面板自检显示，不需要 F12 控制台）
     const diag = {
@@ -63,6 +63,12 @@
     function saveBackup(map) {
         try { localStorage.setItem(STORAGE_KEY_BACKUP, JSON.stringify(map)); } catch (e) { /* ignore */ }
     }
+    // 角色名键：云平台角色顶层 name 可能为 null，真名在 data.name，统一取第一个非空
+    function charNameKey(char) {
+        if (!char) return '';
+        return char.name || (char.data && char.data.name) || '';
+    }
+
     function backupFor(charName) {
         return loadBackup()[charName] || null;
     }
@@ -449,7 +455,7 @@
         diag.lastSyncAt = Date.now();
         diag.charPath = path;
         if (fromPoll) diag.pollAdded = added.join('、');
-        writeBackup(char.name, content); // 无论平台是否落盘，本地备份先存
+        writeBackup(charNameKey(char), content); // 无论平台是否落盘，本地备份先存
 
         // 保存：多路探测保存接口，任一路成功即可（云酒馆/fork 的 getContext 挂载不一致）。
         // 优先标准 context.saveCharacterDebounced，其次全局 saveCharacterDebounced(index,char)。
@@ -462,19 +468,32 @@
     }
 
     // 多路保存：穷举 context / window / SillyTavern 上所有可能的保存接口，挨个试。
+    // 云平台把角色世界书作为独立 world info 存，所以 saveWorldInfo 最优先；
+    // 部分平台把 character_book 算角色元数据，saveMetadataDebounced 也试。
     // 记录诊断：哪些接口存在、实际调到哪一路、是否抛错。
     function saveCharacterSafe(context, index, char) {
         diag.lastSaveFound = [];
         diag.lastSaveError = '';
         const attempts = [];
-        // 1) context 上的保存方法（无参变体，保存当前角色）
+        // 1) 云平台最常见：角色世界书 = 独立 world info → context.saveWorldInfo()
+        if (context && typeof context.saveWorldInfo === 'function') {
+            attempts.push(['context.saveWorldInfo', () => context.saveWorldInfo()]);
+        }
+        // 2) context 上的角色保存方法（无参变体，保存当前角色）
         const ctxKeys = ['saveCharacterDebounced', 'saveCharacter', 'saveCharacterCard', 'saveCharacterSettings'];
         for (const k of ctxKeys) {
             if (context && typeof context[k] === 'function') {
                 attempts.push(['context.' + k, () => context[k]()]);
             }
         }
-        // 2) window / SillyTavern 全局保存方法（带参：index, char）
+        // 3) 元数据保存（部分平台把 character_book 算角色元数据）
+        const metaKeys = ['saveMetadataDebounced', 'saveMetadata'];
+        for (const k of metaKeys) {
+            if (context && typeof context[k] === 'function') {
+                attempts.push(['context.' + k, () => context[k]()]);
+            }
+        }
+        // 4) window / SillyTavern 全局保存方法（带参：index, char）
         const globals = ['saveCharacterDebounced', 'saveCharacter', 'saveCharacterCard'];
         for (const k of globals) {
             const f1 = window.SillyTavern && typeof window.SillyTavern[k] === 'function' ? window.SillyTavern[k] : null;
@@ -512,11 +531,11 @@
             diag.charPath = path;
             const entries = cb.entries;
             const existing = entries.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
-            const b = backupFor(char.name);
+            const b = backupFor(charNameKey(char));
             const countItems = (s) => { const m = s ? s.match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) : null; return m ? m.length : 0; };
             if (existing) {
                 if (countItems(existing.content) > 0) {
-                    refreshBackup(char.name, existing.content);
+                    refreshBackup(charNameKey(char), existing.content);
                     diag.loadReapply = '内存已有已购衣物库（含款式），采用平台版本';
                     return true;
                 }
@@ -528,7 +547,7 @@
                     saveCharacterSafe(context, target.index, char);
                     return true;
                 }
-                refreshBackup(char.name, existing.content);
+                refreshBackup(charNameKey(char), existing.content);
                 diag.loadReapply = '内存已有已购衣物库（空条目），备份无内容可覆盖';
                 return true;
             }
