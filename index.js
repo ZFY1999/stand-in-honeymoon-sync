@@ -26,7 +26,7 @@
     // 已购库本地备份：云平台若保存不落盘，扩展每次加载从这恢复，保证模型能读到已购库
     const STORAGE_KEY_BACKUP = 'standInHoneyMoonSync_backup_v1';
     const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
-    const SETTINGS_VERSION = '1.4.0';
+    const SETTINGS_VERSION = '1.5.0';
 
     // 诊断记录（设置面板自检显示，不需要 F12 控制台）
     const diag = {
@@ -51,6 +51,9 @@
         editorSynced: false, // 是否同步进编辑器活动书(characterBook/settings.world_info)
         saveRequests: [],    // 抓到的平台保存/同步请求（fetch + XHR 拦截）
         wiTestResult: '',    // 写 worldInfo 落盘测试结果
+        serverScan: '',      // 服务器世界书扫描结果（自检异步探测）
+        serverScanAt: 0,
+        serverWriteResult: '', // 已购库写入服务器世界书结果
     };
 
     // 轮询状态：事件系统不可靠（云平台可能不发 MESSAGE_RECEIVED），靠 chat.length 变化兜底。
@@ -831,10 +834,10 @@
 
         const $diag = panel.querySelector('#sihs-self-check');
         if ($diag) {
-            $diag.addEventListener('click', () => {
+            $diag.addEventListener('click', async () => {
                 const pre = panel.querySelector('#sihs-diag-pre');
                 if (!pre) return;
-                const text = runSelfCheck();
+                const text = await runSelfCheck();
                 pre.textContent = text;
                 pre.style.display = 'block';
                 showToast('info', '自检完成，结果已显示（复制发给暮蝶）');
@@ -854,6 +857,11 @@
         const $exportCard = panel.querySelector('#sihs-export-card');
         if ($exportCard) {
             $exportCard.addEventListener('click', exportCardNow);
+        }
+
+        const $writeServer = panel.querySelector('#sihs-write-server');
+        if ($writeServer) {
+            $writeServer.addEventListener('click', () => { writeServerWorldInfoNow(); });
         }
 
         const $gh = panel.querySelector('#sihs-open-github');
@@ -1026,6 +1034,142 @@
         } catch (e) { /* ignore */ }
     }
 
+    // --- 服务器世界书 API（从 AutoCardUpdater 学来的真落盘路） ---
+    // 之前抓包确认：平台编辑器保存世界书就是 POST /api/worldinfo/edit (status=200)。
+    // AutoCardUpdater 能改世界书且改动可见，全靠这条原生 API。暮蝶直接抄它。
+    async function serverApi(method, path, body) {
+        let headers = { 'Content-Type': 'application/json' };
+        try {
+            const ctx = getContext();
+            if (ctx && ctx.common && typeof ctx.common.getRequestHeaders === 'function') {
+                headers = ctx.common.getRequestHeaders();
+            }
+        } catch (e) { /* ignore */ }
+        const opts = { method, headers };
+        if (body !== undefined) opts.body = JSON.stringify(body);
+        return await fetch('/api/worldinfo/' + path, opts);
+    }
+
+    // 拉全部世界书名字（GET /api/worldinfo/all）
+    async function serverBookNames() {
+        try {
+            const res = await serverApi('GET', 'all');
+            if (!res.ok) return { ok: false, err: 'HTTP ' + res.status };
+            const data = await res.json().catch(() => null);
+            const list = data && (data.data || data.world_info);
+            if (!Array.isArray(list)) return { ok: true, names: [] };
+            return {
+                ok: true,
+                names: list
+                    .map((b) => (typeof b === 'string' ? b : b && (b.name || b.id || '')))
+                    .filter(Boolean),
+            };
+        } catch (e) {
+            return { ok: false, err: String((e && e.message) || e) };
+        }
+    }
+
+    // 读一本服务器书全部条目（GET /api/worldinfo/get?name=书）
+    async function serverReadBook(name) {
+        try {
+            const res = await serverApi('GET', 'get?name=' + encodeURIComponent(name));
+            if (!res.ok) return { ok: false, err: 'HTTP ' + res.status };
+            const data = await res.json().catch(() => null);
+            const entries = (data && (data.entries || data.data)) || [];
+            return { ok: true, entries };
+        } catch (e) {
+            return { ok: false, err: String((e && e.message) || e) };
+        }
+    }
+
+    // 找服务器上含「可购买衣物库」的世界书（遍历所有书逐个读，书不多可接受）
+    async function findServerShelfBook() {
+        const all = await serverBookNames();
+        if (!all.ok) return { ok: false, err: all.err };
+        const hasShelf = (e) => e && String((e.comment || '') + (e.name || '')).includes('可购买衣物库');
+        for (const name of all.names) {
+            try {
+                const r = await serverReadBook(name);
+                if (r.ok && r.entries.some(hasShelf)) {
+                    return { ok: true, book: name, entries: r.entries };
+                }
+            } catch (e) { /* ignore */ }
+        }
+        return { ok: false, err: '服务器上没有找到含「可购买衣物库」的世界书（共 ' + all.names.length + ' 本）' };
+    }
+
+    // 按钮：把已购衣物库写到服务器世界书（POST /api/worldinfo/create 或 edit，写完整条目）
+    async function writeServerWorldInfoNow() {
+        const lines = ['【已购库写入服务器世界书】'];
+        try {
+            const c = getContext();
+            const t = c ? getTargetCharacter(c) : null;
+            if (!t) { lines.push('未找到目标角色'); writeServerResult(lines); return; }
+            const { cb } = resolveCharBook(t.char);
+            const pur = cb && cb.entries.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
+            const b = backupFor(charNameKey(t.char));
+            const content = (b && b.content) || (pur && pur.content);
+            if (!content) { lines.push('没有已购库内容（先买一件，或点立即同步）'); writeServerResult(lines); return; }
+            const n = (content.match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) || []).length;
+            lines.push('已购库 content ' + content.length + ' 字，' + n + ' 款');
+
+            lines.push('探测服务器世界书...');
+            const shelf = await findServerShelfBook();
+            if (!shelf.ok) { lines.push('未找到目标书：' + shelf.err); writeServerResult(lines); return; }
+            lines.push('命中服务器世界书: ' + shelf.book + '（' + shelf.entries.length + ' 条）');
+            const shelfE = shelf.entries.find((e) => e && String((e.comment || '') + (e.name || '')).includes('可购买衣物库'));
+            if (shelfE && shelfE.content) lines.push('服务器可购买库长度: ' + shelfE.content.length + ' 字');
+
+            const existing = shelf.entries.find((e) => e && String((e.comment || '') + (e.name || '')).includes('已购衣物库'));
+            // 条目：保留已有条目的其余字段（uid 等），只换 content
+            const entry = Object.assign({}, existing || {}, {
+                comment: '已购衣物库',
+                content,
+                keys: ['已购', '衣物', '购买', '购入'],
+            });
+            if (!existing) {
+                const r = await serverApi('POST', 'create', { name: shelf.book, data: entry });
+                lines.push('服务器无已购条目 → create: HTTP ' + r.status);
+                if (r.ok) {
+                    const j = await r.json().catch(() => null);
+                    lines.push('create 返回: ' + JSON.stringify(j).slice(0, 120));
+                }
+            } else {
+                const r = await serverApi('POST', 'edit', { name: shelf.book, data: entry });
+                lines.push('服务器已有已购条目(uid=' + existing.uid + ') → edit: HTTP ' + r.status);
+            }
+            // 回读验证
+            const v = await serverReadBook(shelf.book);
+            if (v.ok) {
+                const vp = v.entries.find((e) => e && String((e.comment || '') + (e.name || '')).includes('已购衣物库'));
+                if (vp) {
+                    const vn = ((vp.content || '').match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) || []).length;
+                    lines.push('回读验证: 服务器「已购衣物库」存在，' + vn + ' 款' + (vp.content && /泳【泳03】/.test(vp.content) ? '，含泳03 ✓' : '，不含泳03 ✗'));
+                } else {
+                    lines.push('回读验证: 服务器上没有「已购衣物库」 ✗');
+                }
+            } else {
+                lines.push('回读验证失败: ' + v.err);
+            }
+        } catch (e) {
+            lines.push('异常: ' + String((e && e.message) || e));
+        }
+        writeServerResult(lines);
+    }
+
+    function writeServerResult(lines) {
+        diag.serverWriteResult = lines.join('\n');
+        log(lines.join('\n'));
+        showToast('info', '服务器世界书写入完成，结果已显示');
+        try {
+            const panel = getSettingsPanel();
+            if (panel) {
+                const pre = panel.querySelector('#sihs-diag-pre');
+                if (pre) { pre.textContent = lines.join('\n'); pre.style.display = 'block'; }
+            }
+        } catch (e) { /* ignore */ }
+    }
+
     // 导出角色卡（含最新已购衣物库）：平台保存不落盘，唯一可靠的"同步到服务器/编辑器"路径
     // 就是"重新导入卡"。买完衣服点这个 → 下载一张完整 v3 卡 → 导入覆盖原角色 → 服务器就有最新已购库。
     function exportCardNow() {
@@ -1164,7 +1308,7 @@
         return out;
     }
 
-    function runSelfCheck() {
+    async function runSelfCheck() {
         const lines = [];
         try {
             const context = getContext();
@@ -1341,6 +1485,36 @@
                 lines.push('备份含当前角色: 否');
             }
 
+            // 服务器世界书扫描（异步，放最后，不阻塞前面）
+            try {
+                lines.push('[服务器世界书]');
+                const all = await serverBookNames();
+                if (!all.ok) {
+                    lines.push('  all 失败: ' + all.err + '（此平台可能没开 /api/worldinfo 路由）');
+                } else if (!all.names.length) {
+                    lines.push('  （服务器返回空列表）');
+                } else {
+                    for (const name of all.names) {
+                        try {
+                            const r = await serverReadBook(name);
+                            if (!r.ok) { lines.push('  - ' + name + '：读取失败 ' + r.err); continue; }
+                            const hasShelf = r.entries.some((e) => e && String((e.comment || '') + (e.name || '')).includes('可购买衣物库'));
+                            const hasPur = r.entries.some((e) => e && String((e.comment || '') + (e.name || '')).includes('已购衣物库'));
+                            lines.push('  - ' + name + '：' + r.entries.length + ' 条' + (hasShelf ? ' [含可购买库]' : '') + (hasPur ? ' [含已购库]' : ''));
+                            if (hasShelf) {
+                                const shelfE = r.entries.find((e) => e && String((e.comment || '') + (e.name || '')).includes('可购买衣物库'));
+                                if (shelfE && shelfE.content) lines.push('    可购买库内容长度: ' + shelfE.content.length + ' 字');
+                                if (shelfE && shelfE.uid !== undefined) lines.push('    可购买库 uid: ' + shelfE.uid);
+                            }
+                        } catch (e) { lines.push('  - ' + name + '：扫描异常'); }
+                    }
+                }
+                diag.serverScan = lines[lines.length - 1] || '';
+                diag.serverScanAt = Date.now();
+            } catch (e) {
+                lines.push('[服务器世界书] 扫描异常: ' + String((e && e.message) || e));
+            }
+
             lines.push('[加载恢复]');
             lines.push('最近一次: ' + (diag.loadReapply || '(尚未执行)'));
 
@@ -1349,6 +1523,10 @@
             if (diag.wiTestResult) {
                 lines.push('');
                 lines.push(diag.wiTestResult);
+            }
+            if (diag.serverWriteResult) {
+                lines.push('');
+                lines.push(diag.serverWriteResult);
             }
         } catch (e) {
             lines.push('自检异常: ' + (e && e.message));
