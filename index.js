@@ -8,6 +8,7 @@
 // 防误判：试穿/只看不买/先不买 等强否定不触发；款式名歧义不触发
 // 防越权：只新建/维护「已购衣物库」这一个条目，绝不碰可购买库、已有库和其他条目
 // 容错：任何异常静默返回，不打断对话
+// 设置面板：manifest.settings 指向 settings.html（扩展菜单抽屉）；含启用开关/状态/手动同步
 
 (function () {
     'use strict';
@@ -21,6 +22,9 @@
     const saveCharacterDebounced = _st.saveCharacterDebounced || window.saveCharacterDebounced;
 
     const PREFIX = '[已购衣物同步]';
+    const STORAGE_KEY_ENABLED = 'standInHoneyMoonSync_enabled_v1';
+    const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
+    const SETTINGS_VERSION = '1.1.0';
 
     // 可购买库分类汉字 → 分区标题（已购衣物库内的分区名）
     const CATEGORY_NAMES = {
@@ -73,6 +77,28 @@
 
     function log(...args) {
         console.log(PREFIX, ...args);
+    }
+
+    // 提示条：优先 toastr，兜底 console
+    function showToast(type, msg) {
+        try {
+            if (window.toastr && typeof window.toastr[type] === 'function') {
+                window.toastr[type](msg, '已购衣物同步');
+                return;
+            }
+        } catch (e) { /* ignore */ }
+        log(msg);
+    }
+
+    // 扩展总开关（设置面板可切，localStorage 持久化）
+    let extensionEnabled = true;
+    function loadExtensionEnabled() {
+        try {
+            const v = localStorage.getItem(STORAGE_KEY_ENABLED);
+            extensionEnabled = v === null ? true : v === 'true';
+        } catch (e) {
+            extensionEnabled = true;
+        }
     }
 
     // 解析可购买库所有衣物块标题，供款式名匹配。
@@ -253,6 +279,7 @@
     }
 
     function handleMessages(messages) {
+        if (!extensionEnabled) return; // 设置里关了总开关则跳过
         const context = getContext();
         if (!context) return;
         const target = getTargetCharacter(context);
@@ -331,12 +358,140 @@
         }
     }
 
+    // --- 设置面板（扩展菜单抽屉） ---
+
+    function getSettingsPanel() {
+        return document.querySelector(
+            `[data-extension-name="${SETTINGS_EXTENSION_NAME}"]`,
+        );
+    }
+
+    // 自动渲染兜底：SillyTavern 正常情况下会按 manifest.settings 把 settings.html
+    // 渲染进扩展菜单抽屉；若托管平台没渲染，则手动注入 #extensions_settings2。
+    function ensureSettingsPanel() {
+        if (getSettingsPanel()) return;
+        try {
+            const host = document.querySelector('#extensions_settings2');
+            if (!host) return;
+            if (host.querySelector(`[data-extension-name="${SETTINGS_EXTENSION_NAME}"]`)) return;
+            const urls = [
+                `/extensions/${SETTINGS_EXTENSION_NAME}/settings.html`,
+                `/scripts/extensions/third-party/${SETTINGS_EXTENSION_NAME}/settings.html`,
+            ];
+            let i = 0;
+            const tryFetch = () => {
+                if (i >= urls.length) return;
+                fetch(urls[i])
+                    .then((r) => (r.ok ? r.text() : Promise.reject(new Error('not found'))))
+                    .then((html) => {
+                        if (getSettingsPanel()) return;
+                        host.insertAdjacentHTML('beforeend', html);
+                        bindSettingsPanel();
+                    })
+                    .catch(() => { i++; tryFetch(); });
+            };
+            tryFetch();
+        } catch (e) { /* ignore */ }
+    }
+
+    // 面板渲染时机不定，轮询等它出现后绑定（最多约 10 秒）
+    function initSettingsPanel() {
+        let tries = 0;
+        const poll = () => {
+            const panel = getSettingsPanel();
+            if (panel) {
+                bindSettingsPanel();
+                return;
+            }
+            if (tries++ < 20) {
+                setTimeout(poll, 500);
+            } else {
+                // 自动渲染一直没出现 → 手动兜底注入
+                ensureSettingsPanel();
+            }
+        };
+        setTimeout(poll, 300);
+    }
+
+    function bindSettingsPanel() {
+        const panel = getSettingsPanel();
+        if (!panel || panel.dataset.bound) return;
+        panel.dataset.bound = '1';
+
+        const $cb = panel.querySelector('#sihs-enabled-checkbox');
+        if ($cb) {
+            $cb.checked = extensionEnabled;
+            $cb.addEventListener('change', () => {
+                extensionEnabled = $cb.checked;
+                try {
+                    localStorage.setItem(STORAGE_KEY_ENABLED, String(extensionEnabled));
+                } catch (e) { /* ignore */ }
+                showToast(extensionEnabled ? '已购衣物同步已启用' : '已购衣物同步已禁用');
+                updateSettingsStatus();
+            });
+        }
+
+        const $sync = panel.querySelector('#sihs-force-sync');
+        if ($sync) $sync.addEventListener('click', forceSyncNow);
+
+        const $gh = panel.querySelector('#sihs-open-github');
+        if ($gh) {
+            $gh.addEventListener('click', () => {
+                window.open('https://github.com/ZFY1999/stand-in-honeymoon-sync', '_blank');
+            });
+        }
+
+        const $ver = panel.querySelector('#sihs-version');
+        if ($ver) $ver.textContent = SETTINGS_VERSION;
+
+        updateSettingsStatus();
+    }
+
+    function updateSettingsStatus() {
+        const panel = getSettingsPanel();
+        if (!panel) return;
+        const $disp = panel.querySelector('#sihs-status-display');
+        if (!$disp) return;
+        let text = '';
+        try {
+            const context = getContext();
+            const target = getTargetCharacter(context);
+            if (!target) {
+                text = '未找到带「可购买衣物库」的角色（当前角色需是"代替蜜月"）。';
+            } else {
+                const entries = target.char.character_book.entries;
+                const hasShelf = entries.some((e) => e.comment && e.comment.includes('可购买衣物库'));
+                const hasPurchased = entries.some((e) => e.comment && e.comment.includes('已购衣物库'));
+                text = `目标角色：${target.char.name}；可购买库：${hasShelf ? '有' : '无'}；已购衣物库：${hasPurchased ? '已创建' : '尚未创建（首次购买时自动创建）'}。`;
+            }
+        } catch (e) {
+            text = '状态获取失败（不影响监听）。';
+        }
+        $disp.textContent = text;
+    }
+
+    function forceSyncNow() {
+        if (!extensionEnabled) {
+            showToast('warning', '扩展已禁用，请先在设置里启用。');
+            return;
+        }
+        let messages = [];
+        try {
+            const c = getContext();
+            if (c && Array.isArray(c.chat)) messages = c.chat.slice(-5);
+        } catch (e) { /* ignore */ }
+        handleMessages(messages);
+        setTimeout(updateSettingsStatus, 300);
+    }
+
     function init() {
+        loadExtensionEnabled();
         if (eventSource && event_types) {
             eventSource.on(event_types.MESSAGE_RECEIVED, onMessage);
             eventSource.on(event_types.MESSAGE_SENT, onMessage);
         }
         log('扩展已加载，监听购买场景。');
+        initSettingsPanel();
     }
 
     init();
