@@ -26,7 +26,7 @@
     // 已购库本地备份：云平台若保存不落盘，扩展每次加载从这恢复，保证模型能读到已购库
     const STORAGE_KEY_BACKUP = 'standInHoneyMoonSync_backup_v1';
     const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
-    const SETTINGS_VERSION = '1.1.4';
+    const SETTINGS_VERSION = '1.1.5';
 
     // 诊断记录（设置面板自检显示，不需要 F12 控制台）
     const diag = {
@@ -144,6 +144,15 @@
 
     function log(...args) {
         console.log(PREFIX, ...args);
+    }
+
+    // 兼容多种聊天消息正文格式：标准 SillyTavern 用 mes（is_user 标记），部分平台用 message/content。
+    function msgText(m) {
+        if (!m) return '';
+        if (typeof m.message === 'string') return m.message;
+        if (typeof m.mes === 'string') return m.mes;
+        if (typeof m.content === 'string') return m.content;
+        return '';
     }
 
     // 提示条：优先 toastr，兜底 console
@@ -414,8 +423,9 @@
         const added = [];
 
         for (const msg of messages) {
-            if (!msg || typeof msg.message !== 'string') continue;
-            const buys = analyzeMessage(msg.message, shelfTitles);
+            const mtext = msgText(msg);
+            if (!mtext) continue;
+            const buys = analyzeMessage(mtext, shelfTitles);
             for (const b of buys) {
                 if (isAlreadyPurchased(content, b.cat, b.num)) {
                     log(`跳过重复：${b.id}`);
@@ -535,8 +545,8 @@
             diag.lastEventHadMsg = messages.length;
         }
         diag.recentMessages = messages.slice(-5).map((m) => ({
-            role: m && m.role,
-            text: m && typeof m.message === 'string' ? m.message.slice(0, 100) : '',
+            role: m && (m.role || (m.is_user ? 'user' : m.name || '?')),
+            text: msgText(m).slice(0, 100),
         }));
         try {
             handleMessages(messages);
