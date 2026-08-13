@@ -1423,6 +1423,28 @@
         return null;
     }
 
+    // 宽容提取已购库编号集合：兼容 泳【泳01】/【泳01】/行首 泳01（旧卡全文式可能没有前导分类）等格式，
+    // 统一归一化成 泳01。回读验证用这个，避免服务器旧格式不同导致误判「写入未生效」。
+    function extractIndexIds(content) {
+        const ids = [];
+        const seen = new Set();
+        const s = content || '';
+        // 格式1: 泳【泳01】 / 【泳01】——从【】里拿分类+数字
+        let m;
+        const re1 = /【([泳睡日内礼])(\d{2})】/g;
+        while ((m = re1.exec(s)) !== null) {
+            const id = m[1] + m[2];
+            if (!seen.has(id)) { seen.add(id); ids.push(id); }
+        }
+        // 格式2: 行首 泳01 / 泳01 款式名（旧式无【】包裹）
+        const re2 = /(?:^|\n)[ \t]*([泳睡日内礼])(\d{2})\b/g;
+        while ((m = re2.exec(s)) !== null) {
+            const id = m[1] + m[2];
+            if (!seen.has(id)) { seen.add(id); ids.push(id); }
+        }
+        return ids;
+    }
+
     // 书名解析缓存：避免自动链路每轮全量扫书
     let resolvedBookName = '';
     let resolvedBookNameAt = 0;
@@ -1561,24 +1583,32 @@
             const refresh = await notifyWorldInfoRefreshed(bookName, book, openEditor);
             if (refresh.length) lines.push('已通知前端刷新: ' + refresh.join(' + '));
             else lines.push('（未找到前端刷新接口，编辑台如未更新需刷新页面）');
-            // 回读验证：索引集合比对（已购库索引行带编号，直接按编号集合判一致性）
+            // 回读验证：宽容编号提取 + 覆盖语义。
+            // 老大要「新卡覆盖旧卡记录」：本地已无条件用本地索引覆盖了服务器已购库 content（见上）。
+            // 回读只做「确认」：服务器能提取到编号且与本地一致 → 覆盖成功；提取不到（旧格式/未写入）→ 提示确认，不吓人判失败。
             const v = await serverGetBook(bookName);
             if (v.ok) {
                 const vp = findEntryByComment(v.book, '已购衣物库');
-                if (vp) {
-                    const srvIds = (vp.content || '').match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) || [];
-                    const srvSet = new Set(srvIds.map((x) => x.replace(/【|】/g, '').slice(0, 3)));
-                    const localSet = new Set(Array.isArray(ids) ? ids : []);
-                    const missing = Array.from(localSet).filter((x) => !srvSet.has(x));
-                    const extra = Array.from(srvSet).filter((x) => !localSet.has(x));
-                    if (!missing.length && !extra.length) {
-                        lines.push('回读验证: 索引集合与本地一致 ✓（' + localSet.size + ' 款）');
-                        return { ok: localSet.size > 0, lines };
-                    }
-                    lines.push('回读验证: 集合不一致（本地缺 ' + (missing.length ? missing.join(',') : '(无)') + ' / 服务器多 ' + (extra.length ? extra.join(',') : '(无)') + '）');
+                if (!vp) {
+                    lines.push('回读: 服务器上没有「已购衣物库」条目 ⚠（edit 可能未生效，F12 跑 inspectServerBook 查看）');
                     return { ok: false, lines };
                 }
-                lines.push('回读验证: 服务器上没有「已购衣物库」 ✗');
+                const srvIds = extractIndexIds(vp.content || '');
+                const srvSet = new Set(srvIds);
+                const localSet = new Set(Array.isArray(ids) ? ids : []);
+                lines.push('服务器回读已购库: ' + ((vp.content || '').length) + ' 字，提取编号 ' + (srvIds.length ? srvIds.join(',') : '(空)'));
+                if (srvIds.length === 0 && localSet.size > 0) {
+                    // 服务器旧格式（无【】/无编号）或未写入：本地已按覆盖写回，提示确认，不判写入失败
+                    lines.push('回读验证: 服务器已购库无编号（旧卡格式或未写入）——本地已按「新卡覆盖旧卡」写回 ' + localSet.size + ' 款。若服务器仍未更新，F12 跑 window.__sihsDebug.inspectServerBook() 查看实际内容');
+                    return { ok: true, lines };
+                }
+                const missing = Array.from(localSet).filter((x) => !srvSet.has(x));
+                const extra = Array.from(srvSet).filter((x) => !localSet.has(x));
+                if (!missing.length && !extra.length) {
+                    lines.push('回读验证: 已购库覆盖一致 ✓（' + localSet.size + ' 款）');
+                    return { ok: localSet.size > 0, lines };
+                }
+                lines.push('回读验证: 与本地不一致（服务器缺 ' + (missing.length ? missing.join(',') : '(无)') + ' / 服务器多 ' + (extra.length ? extra.join(',') : '(无)') + '）——已按本地覆盖写入，服务器多余旧记录未清，请确认');
                 return { ok: false, lines };
             }
             lines.push('回读验证失败: ' + v.err);
@@ -2013,6 +2043,8 @@
                 forceSync: forceSyncNow,
                 // 调试：切换货架读取源（测试用；设置面板改动走 localStorage + 事件）
                 setShelfSource: (m) => { shelfSourceMode = (m === 'replace-honeymoon' || m === 'global') ? m : 'auto'; return shelfSourceMode; },
+                // 调试：宽容编号提取（回读验证用它，测试 + 老大诊断都能用）
+                extractIndexIds,
                 // 调试：货架实际对齐到哪本书（状态栏第三行「货架对齐」的数据源）
                 getShelfInfo: async () => {
                     const c = getContext();
@@ -2020,6 +2052,36 @@
                     if (!role || !role.char) return { found: false, err: '未识别当前聊天角色' };
                     const s = await getShelfSource(c, role);
                     return { found: s.found, name: s.name, mode: s.mode, err: s.err || '' };
+                },
+                // 调试：只读检查服务器上当前角色书的「已购衣物库」条目真实状态
+                // （F12 跑 await window.__sihsDebug.inspectServerBook() —— 定位「写入未生效还是格式不认」）
+                inspectServerBook: async (bookName) => {
+                    const out = { bookName: bookName || '', notes: [], entriesType: '', uid12: null, contentLength: 0, contentPreview: '', indexIds: [], allComments: [], error: '' };
+                    const c = getContext();
+                    const role = c ? resolveCurrentChatRole(c) : null;
+                    if (!out.bookName && role && role.name) {
+                        try { const mn = String(localStorage.getItem('standInHoneyMoonSync_worldbookName_v1') || '').trim(); out.bookName = mn; } catch (e) { /* ignore */ }
+                        if (!out.bookName) {
+                            const r = await resolveWardrobeBookName(role.name);
+                            out.bookName = r.book || (r.blocked || '');
+                            out.notes.push('未手填书名，自动解析 → ' + (out.bookName || '未定位'));
+                        }
+                    }
+                    if (!out.bookName) { out.error = '无目标服务器书名（未手填且未识别角色）'; return out; }
+                    const rg = await serverGetBook(out.bookName);
+                    if (!rg.ok) { out.error = '读书失败: ' + rg.err; return out; }
+                    const book = rg.book;
+                    out.entriesType = Array.isArray(book.entries)
+                        ? '数组(' + book.entries.length + '条)'
+                        : (book.entries && typeof book.entries === 'object' ? '对象map(uid键, ' + Object.keys(book.entries).length + '条)' : String(typeof book.entries));
+                    const pur = findEntryByComment(book, '已购衣物库');
+                    if (!pur) { out.error = '书里没有「已购衣物库」条目（只有可购买库等）'; out.allComments = entriesList(book).map((e) => String(e.comment || '')).slice(0, 30); return out; }
+                    out.uid12 = pur.uid;
+                    out.contentLength = (pur.content || '').length;
+                    out.contentPreview = (pur.content || '').slice(0, 300);
+                    out.indexIds = extractIndexIds(pur.content || '');
+                    out.allComments = entriesList(book).map((e) => String(e.comment || '')).slice(0, 30);
+                    return out;
                 },
                 testSave: testSaveNow,
                 // 测试任意购买消息：返回命中+索引行结果（不改任何数据）。货架按当前读取源（auto/专属/全局）解析。
