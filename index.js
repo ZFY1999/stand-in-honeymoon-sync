@@ -26,7 +26,7 @@
     // 已购库本地备份：云平台若保存不落盘，扩展每次加载从这恢复，保证模型能读到已购库
     const STORAGE_KEY_BACKUP = 'standInHoneyMoonSync_backup_v1';
     const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
-    const SETTINGS_VERSION = '1.3.0';
+    const SETTINGS_VERSION = '1.3.1';
 
     // 诊断记录（设置面板自检显示，不需要 F12 控制台）
     const diag = {
@@ -49,6 +49,7 @@
         targetIndex: -1,     // 目标角色在 characters 数组的下标
         charIdChar: '',      // characterId 指向的角色名
         editorSynced: false, // 是否同步进编辑器活动书(characterBook/settings.world_info)
+        saveRequests: [],    // 抓到的平台保存/同步请求（fetch + XHR 拦截）
     };
 
     // 轮询状态：事件系统不可靠（云平台可能不发 MESSAGE_RECEIVED），靠 chat.length 变化兜底。
@@ -57,6 +58,67 @@
     function fmtTime(ts) {
         if (!ts) return '';
         try { return new Date(ts).toLocaleTimeString('zh-CN', { hour12: false }); } catch (e) { return String(ts); }
+    }
+
+    // --- 保存请求拦截（fetch + XHR） ---
+    // 平台保存到底走哪条网络请求、响应啥，直接抓出来看，不猜。记录最近的写入类请求。
+    function installRequestHook() {
+        if (window.__sihsReqHook) return;
+        window.__sihsReqHook = true;
+        const record = (req) => {
+            if (!req || !req.url) return;
+            if (!/save|character|world|settings|chat|avatar|api/i.test(req.url)) return;
+            if (req.method === 'GET') return; // 只抓写操作
+            diag.saveRequests.push(req);
+            if (diag.saveRequests.length > 30) diag.saveRequests.shift();
+        };
+        // fetch
+        try {
+            const origFetch = window.fetch;
+            if (typeof origFetch === 'function') {
+                window.fetch = function (...args) {
+                    try {
+                        const url = String(args[0] && args[0].url ? args[0].url : (args[0] || ''));
+                        const method = (args[1] && args[1].method) || (args[0] && args[0].method) || 'GET';
+                        const body = (args[1] && args[1].body) || (args[0] && args[0].body) || '';
+                        record({ t: Date.now(), method, url, len: body ? String(body).length : 0 });
+                    } catch (e) { /* ignore */ }
+                    return origFetch.apply(this, args).then((r) => {
+                        try {
+                            const last = diag.saveRequests[diag.saveRequests.length - 1];
+                            if (last && last.status === undefined) last.status = r.status;
+                        } catch (e) { /* ignore */ }
+                        return r;
+                    });
+                };
+            }
+        } catch (e) { /* ignore */ }
+        // XHR
+        try {
+            const proto = XMLHttpRequest.prototype;
+            const origOpen = proto.open;
+            const origSend = proto.send;
+            proto.open = function (method, url, ...rest) {
+                this.__sihsUrl = url;
+                this.__sihsMethod = method;
+                return origOpen.call(this, method, url, ...rest);
+            };
+            proto.send = function (...args) {
+                const self = this;
+                if (this.__sihsUrl) {
+                    const req = { t: Date.now(), method: this.__sihsMethod || 'GET', url: String(this.__sihsUrl), len: (args[0] ? String(args[0]).length : 0) };
+                    try {
+                        this.addEventListener('load', () => {
+                            req.status = this.status;
+                            record(req);
+                        });
+                    } catch (e) {
+                        record(req);
+                    }
+                }
+                return origSend.apply(this, args);
+            };
+        } catch (e) { /* ignore */ }
     }
 
     // --- 已购库本地备份（localStorage） ---
@@ -306,7 +368,8 @@
             const { cb } = resolveCharBook(c);
             return !!cb && cb.entries.some((e) => e && e.comment && String(e.comment).includes('可购买衣物库'));
         };
-        const idx = typeof context.characterId === 'number' ? context.characterId : -1;
+        const idx = (typeof context.characterId === 'number' || typeof context.characterId === 'string')
+            ? Number(context.characterId) : -1;
         if (idx >= 0 && hasShelf(chars[idx])) return { char: chars[idx], index: idx };
         for (let i = 0; i < chars.length; i++) {
             if (hasShelf(chars[i])) return { char: chars[i], index: i };
@@ -859,6 +922,92 @@
 
     // --- 自检诊断（设置面板按钮，不需要 F12 控制台） ---
 
+    // localStorage 全键盘点：看平台把角色/世界书/设置存在哪些键里（含 st- 前缀）
+    function dumpLocalStorageKeys() {
+        const out = [];
+        try {
+            for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                let v = '';
+                try { v = localStorage.getItem(k) || ''; } catch (e) { /* ignore */ }
+                let flag = '';
+                if (/st-|character|world|settings|avatar/i.test(k)) flag += ' ★';
+                if (v.length > 0 && (v.includes('代替蜜月') || v.includes('可购买衣物库'))) flag += ' [含代替蜜月/可购买库数据]';
+                out.push('  ' + k + '(' + v.length + ')' + flag);
+            }
+        } catch (e) { out.push('  (遍历异常: ' + (e && e.message) + ')'); }
+        return out;
+    }
+
+    // context 完整字段盘点：看平台 getContext 到底挂了多少字段
+    function dumpContextKeys(c) {
+        const out = [];
+        if (!c) return out;
+        let keys = [];
+        try { keys = Object.keys(c); } catch (e) { /* ignore */ }
+        for (const k of keys) {
+            let t = typeof c[k];
+            let extra = '';
+            try {
+                if (t === 'object' && c[k]) {
+                    if (Array.isArray(c[k])) extra = '[' + c[k].length + ']';
+                    else extra = '{}';
+                }
+            } catch (e) { /* ignore */ }
+            out.push('  ' + k + ':' + t + extra);
+        }
+        return out;
+    }
+
+    // 全局探测：window / SillyTavern 上关键的角色/世界书/保存符号，并对比 window.characters 与 context.characters 引用
+    function dumpGlobals() {
+        const out = [];
+        const names = ['characters', 'characterBook', 'character_book', 'world_info', 'worldInfo', 'characterId', 'chat_metadata', 'saveCharacter', 'saveCharacterDebounced', 'saveMetadata', 'saveWorldInfo', 'getContext', 'SillyTavern'];
+        for (const n of names) {
+            let val = null;
+            let where = '';
+            try { if (window[n] !== undefined) { val = window[n]; where = 'window'; } } catch (e) { /* ignore */ }
+            if (val === null && window.SillyTavern) {
+                try { if (window.SillyTavern[n] !== undefined) { val = window.SillyTavern[n]; where = 'SillyTavern'; } } catch (e) { /* ignore */ }
+            }
+            if (val === null) { out.push('  ' + n + ': 不存在'); continue; }
+            let desc = '';
+            try {
+                if (typeof val === 'function') desc = 'function';
+                else if (Array.isArray(val)) desc = 'array[' + val.length + ']';
+                else if (val && typeof val === 'object') desc = 'object';
+                else desc = String(val).slice(0, 60);
+            } catch (e) { desc = '?'; }
+            out.push('  ' + n + '(' + where + '): ' + desc);
+        }
+        // 引用对比
+        try {
+            const c = getContext();
+            if (c && c.characters) {
+                if (window.characters) {
+                    out.push('  window.characters === context.characters: ' + (window.characters === c.characters ? '同一引用' : '不同引用'));
+                    if (window.characters !== c.characters && Array.isArray(window.characters)) {
+                        out.push('  window.characters 数量: ' + window.characters.length);
+                        const idx = (typeof c.characterId === 'number' || typeof c.characterId === 'string') ? Number(c.characterId) : 1;
+                        const wc = window.characters[idx];
+                        if (wc) {
+                            const wcb = (wc.data && wc.data.character_book) || wc.character_book;
+                            out.push('  window.characters[' + idx + '] 名: ' + (wc.name || (wc.data && wc.data.name) || '?'));
+                            out.push('  window 那份 data.character_book entries: ' + (wcb ? wcb.entries.length : '无'));
+                            if (wcb && wcb.entries) {
+                                out.push('    含可购买库: ' + (wcb.entries.some((e) => e && String(e.comment || '').includes('可购买衣物库')) ? '是' : '否'));
+                                out.push('    含已购库: ' + (wcb.entries.some((e) => e && String(e.comment || '').includes('已购衣物库')) ? '是' : '否'));
+                            }
+                        }
+                    }
+                } else {
+                    out.push('  window.characters: 不存在（context.characters 无全局对应）');
+                }
+            }
+        } catch (e) { out.push('  (引用对比异常: ' + (e && e.message) + ')'); }
+        return out;
+    }
+
     function runSelfCheck() {
         const lines = [];
         try {
@@ -871,7 +1020,7 @@
                 const chars = c.characters || [];
                 lines.push('characters 数量: ' + chars.length);
                 lines.push('characterId: ' + c.characterId);
-                const cur = typeof c.characterId === 'number' ? chars[c.characterId] : null;
+                const cur = (typeof c.characterId === 'number' || typeof c.characterId === 'string') ? chars[Number(c.characterId)] : null;
                 const curName = cur ? (cur.name || (cur.data && cur.data.name) || '(null)') : '(null)';
                 lines.push('当前角色: ' + curName);
             }
@@ -944,8 +1093,8 @@
                 diag.charPath = path;
                 const entries = (cb && cb.entries) || [];
                 lines.push('目标角色: ' + (target.char.name || (target.char.data && target.char.data.name) || '?'));
-                lines.push('目标角色下标: ' + target.index + '（characterId=' + c.characterId + '，' + (target.index === c.characterId ? '一致' : '不一致 ← 关注') + '）');
-                const idChar = (typeof c.characterId === 'number' && Array.isArray(c.characters) && c.characters[c.characterId]) ? c.characters[c.characterId] : null;
+                lines.push('目标角色下标: ' + target.index + '（characterId=' + c.characterId + '，' + (String(target.index) === String(c.characterId) ? '一致' : '不一致 ← 关注') + '）');
+                const idChar = ((typeof c.characterId === 'number' || typeof c.characterId === 'string') && Array.isArray(c.characters) && c.characters[Number(c.characterId)]) ? c.characters[Number(c.characterId)] : null;
                 lines.push('characterId 指向: ' + (idChar ? (idChar.name || (idChar.data && idChar.data.name) || '(无名)') : '(无)'));
                 if (idChar) {
                     const idcb = resolveCharBook(idChar).cb;
@@ -1000,6 +1149,27 @@
                 for (const k of Object.keys(window)) { if (/save/i.test(k) && typeof window[k] === 'function') envSave.push('win.' + k); }
             } catch (e) { /* ignore */ }
             lines.push('环境含save的函数: ' + (envSave.length ? Array.from(new Set(envSave)).join(', ') : '(无)'));
+
+            lines.push('[保存请求拦截]');
+            if (diag.saveRequests.length) {
+                for (const r of diag.saveRequests.slice(-15)) {
+                    lines.push('  ' + fmtTime(r.t) + ' ' + r.method + ' ' + r.url + ' (status=' + (r.status !== undefined ? r.status : '?') + ', body ' + (r.len || 0) + 'B)');
+                }
+            } else {
+                lines.push('  (暂无抓到的写请求——还没触发过保存)');
+            }
+            lines.push('[localStorage 全键]');
+            const lsKeys = dumpLocalStorageKeys();
+            if (lsKeys.length) { lsKeys.forEach((l) => lines.push(l)); }
+            else { lines.push('  (空)'); }
+            lines.push('[context 完整字段]');
+            const ckKeys = dumpContextKeys(c);
+            if (ckKeys.length) { ckKeys.forEach((l) => lines.push(l)); }
+            else { lines.push('  (无)'); }
+            lines.push('[全局探测]');
+            const glKeys = dumpGlobals();
+            if (glKeys.length) { glKeys.forEach((l) => lines.push(l)); }
+            else { lines.push('  (无)'); }
 
             lines.push('[本地备份]');
             const charName = target && target.char ? (target.char.name || (target.char.data && target.char.data.name)) : '';
@@ -1056,6 +1226,7 @@
     }
 
     function init() {
+        installRequestHook(); // 先装保存请求拦截，越早越好
         loadExtensionEnabled();
         if (eventSource && event_types) {
             eventSource.on(event_types.MESSAGE_RECEIVED, function () {
