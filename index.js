@@ -26,7 +26,7 @@
     // 已购库本地备份：云平台若保存不落盘，扩展每次加载从这恢复，保证模型能读到已购库
     const STORAGE_KEY_BACKUP = 'standInHoneyMoonSync_backup_v1';
     const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
-    const SETTINGS_VERSION = '1.5.0';
+    const SETTINGS_VERSION = '1.5.1';
 
     // 诊断记录（设置面板自检显示，不需要 F12 控制台）
     const diag = {
@@ -893,7 +893,9 @@
                 const entries = (cb && cb.entries) || [];
                 const hasShelf = entries.some((e) => e && e.comment && String(e.comment).includes('可购买衣物库'));
                 const hasPurchased = entries.some((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
-                text = `目标角色：${target.char.name}；可购买库：${hasShelf ? '有' : '无'}；已购衣物库：${hasPurchased ? '已创建' : '尚未创建（首次购买时自动创建）'}；世界书来源：${path || '未找到'}。`;
+                const b = backupFor(charNameKey(target.char));
+                const n = b && b.content ? (b.content.match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) || []).length : 0;
+                text = `目标角色：${charNameKey(target.char) || '(无名)'}；已购衣物库：${hasPurchased ? '已创建' : '尚未创建'}（当前 ${n} 款）；世界书来源：${path || '未找到'}。`;
             }
         } catch (e) {
             text = '状态获取失败（不影响监听）。';
@@ -1041,7 +1043,11 @@
         let headers = { 'Content-Type': 'application/json' };
         try {
             const ctx = getContext();
-            if (ctx && ctx.common && typeof ctx.common.getRequestHeaders === 'function') {
+            // 取请求头：优先顶层 getRequestHeaders（本云平台挂在 getContext 顶层），
+            // 再试标准酒馆的 common.getRequestHeaders（带 CSRF token），都没有就只带 Content-Type。
+            if (ctx && typeof ctx.getRequestHeaders === 'function') {
+                headers = ctx.getRequestHeaders();
+            } else if (ctx && ctx.common && typeof ctx.common.getRequestHeaders === 'function') {
                 headers = ctx.common.getRequestHeaders();
             }
         } catch (e) { /* ignore */ }
@@ -1539,7 +1545,7 @@
         try {
             window.__sihsDebug = {
                 reapplyOnLoad: () => { reapplyOnLoad(); return runSelfCheck(); },
-                getDiag: () => ({ diag, selfCheck: runSelfCheck() }),
+                getDiag: async () => ({ diag, selfCheck: await runSelfCheck() }),
                 getBackup: () => loadBackup(),
                 forceSync: forceSyncNow,
                 testSave: testSaveNow,
