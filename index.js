@@ -29,7 +29,7 @@
     // v1 备份（含编号的旧 content + 预置款式）一次性清除，避免 9 款默认衣服回灌。
     const STORAGE_KEY_BACKUP_V1 = 'standInHoneyMoonSync_backup_v1';
     const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
-    const SETTINGS_VERSION = '1.6.0';
+    const SETTINGS_VERSION = '1.6.1';
 
     // 诊断记录（设置面板自检显示，不需要 F12 控制台）
     const diag = {
@@ -415,7 +415,10 @@
             enabled: true,
             position: 'after_char',
             use_regex: true,
-            keys: ['已购', '衣物', '购买', '购入'],
+            // 同等地位：继承已有衣物库的触发关键词（换衣/穿着/整理行李等场景同样激活）
+            keys: (model && Array.isArray(model.keys) && model.keys.length)
+                ? JSON.parse(JSON.stringify(model.keys))
+                : ['已购', '衣物', '购买', '购入'],
         };
         if (model) {
             // 拷贝其余字段，保证与酒馆世界书兼容
@@ -1158,11 +1161,17 @@
             if (shelfE && shelfE.content) lines.push('服务器可购买库长度: ' + shelfE.content.length + ' 字');
 
             const existing = shelf.entries.find((e) => e && String((e.comment || '') + (e.name || '')).includes('已购衣物库'));
-            // 条目：保留已有条目的其余字段（uid 等），只换 content
+            // 同等地位：key 继承服务器上「已有衣物库」条目的触发词（换衣/穿着场景同样激活）
+            let inheritKeys = null;
+            const srvHave = shelf.entries.find((e) => e && String((e.comment || '') + (e.name || '')).includes('已有衣物库'));
+            if (srvHave && Array.isArray(srvHave.keys) && srvHave.keys.length) {
+                inheritKeys = JSON.parse(JSON.stringify(srvHave.keys));
+            }
+            // 条目：保留已有条目的其余字段（uid 等），只换 content / keys
             const entry = Object.assign({}, existing || {}, {
                 comment: '已购衣物库',
                 content,
-                keys: ['已购', '衣物', '购买', '购入'],
+                keys: inheritKeys || (existing && Array.isArray(existing.keys) && existing.keys.length ? existing.keys : ['已购', '衣物', '购买', '购入']),
             });
             if (!existing) {
                 const r = await serverApi('POST', 'create', { name: shelf.book, data: entry });
