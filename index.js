@@ -29,7 +29,7 @@
     // v1 备份（含编号的旧 content + 预置款式）一次性清除，避免 9 款默认衣服回灌。
     const STORAGE_KEY_BACKUP_V1 = 'standInHoneyMoonSync_backup_v1';
     const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
-    const SETTINGS_VERSION = '1.6.1';
+    const SETTINGS_VERSION = '1.6.3';
 
     // 诊断记录（设置面板自检显示，不需要 F12 控制台）
     const diag = {
@@ -646,6 +646,20 @@
         } else {
             log(`已购衣物已同步：${added.join('、')}（已触发保存：${diag.lastSaveMethod}）`);
         }
+
+        // 真落盘：写入服务器世界书（云平台角色世界书即服务器书；本地无目标书自动跳过）。
+        // fire-and-forget，不阻塞对话；结果进 diag，失败静默（本地备份兜底）。
+        // 这是"买了衣服却没进已购库"的根治：以前只写内存/空壳保存接口，服务器永远没收到。
+        syncServerPurchased(content, purchasedIds).then((r) => {
+            diag.serverWriteResult = r.lines.join('\n');
+            if (r.ok) {
+                log('已购库已写入服务器世界书（' + added.join('、') + '）');
+            } else {
+                log('服务器世界书同步跳过/失败（不影响本地与备份）：' + r.lines.join(' | '));
+            }
+        }).catch((e) => {
+            log('服务器世界书同步异常（已静默）：', e);
+        });
     }
 
     // 多路保存：云平台可能把角色数据存进不同子系统，且"调用不抛错"不代表"落盘了"。
@@ -1078,10 +1092,13 @@
             const ctx = getContext();
             // 取请求头：优先顶层 getRequestHeaders（本云平台挂在 getContext 顶层），
             // 再试标准酒馆的 common.getRequestHeaders（带 CSRF token），都没有就只带 Content-Type。
+            // ⚠ 关键：merge 回来的头一律强制盖上 Content-Type，否则云平台可能拒收 JSON body。
             if (ctx && typeof ctx.getRequestHeaders === 'function') {
-                headers = ctx.getRequestHeaders();
+                const h = ctx.getRequestHeaders();
+                if (h && typeof h === 'object') headers = Object.assign({}, h, { 'Content-Type': 'application/json' });
             } else if (ctx && ctx.common && typeof ctx.common.getRequestHeaders === 'function') {
-                headers = ctx.common.getRequestHeaders();
+                const h = ctx.common.getRequestHeaders();
+                if (h && typeof h === 'object') headers = Object.assign({}, h, { 'Content-Type': 'application/json' });
             }
         } catch (e) { /* ignore */ }
         const opts = { method, headers };
@@ -1137,7 +1154,191 @@
         return { ok: false, err: '服务器上没有找到含「可购买衣物库」的世界书（共 ' + all.names.length + ' 本）' };
     }
 
-    // 按钮：把已购衣物库写到服务器世界书（POST /api/worldinfo/create 或 edit，写完整条目）
+    // --- 服务器世界书写入（公共函数：手动按钮与自动链路共用） ---
+    // 云平台的服务器世界书（模型/编辑台实际读的那份）挂在 window.world_info（对象，键=书名）。
+    // 平台自己的编辑器保存就是调 saveWorldInfo() → POST /api/worldinfo/edit (200)——自检抓包确认。
+    // 所以正确落盘路：往 window.world_info 里那本含「可购买衣物库」的书写条目 → 调 saveWorldInfo()。
+    // /api/worldinfo/all 那条路（GET 扫书名）本平台没这路由（404），只留作标准酒馆兜底。
+
+    // 会话内缓存 /api 兜底的书探测结果 60 秒，避免每轮全量扫书（本平台 /api 404，几乎不会用到）
+    let serverBookCache = { book: '', entries: null, at: 0, err: '' };
+
+    // 在 window.world_info / context.worldInfo 里递归找含「可购买衣物库」的 entries 数组。
+    // 云平台结构可能是 { 书名: { entries: [...] } }，也可能是嵌套数组，递归扫所有层级。
+    function findPlatformShelfBook() {
+        const roots = [];
+        try { roots.push(window.world_info); } catch (e) { /* ignore */ }
+        try {
+            const c = getContext();
+            if (c && c.worldInfo) roots.push(c.worldInfo);
+        } catch (e) { /* ignore */ }
+        const out = [];
+        const hasShelf = (arr) => Array.isArray(arr) && arr.some((e) => e && e.comment && String(e.comment).includes('可购买衣物库'));
+        const walk = (root, depth) => {
+            if (!root || depth > 8 || out.length) return;
+            if (Array.isArray(root)) {
+                if (hasShelf(root)) { out.push({ book: '', bookObj: null, entries: root }); return; }
+                for (const item of root) walk(item, depth + 1);
+                return;
+            }
+            if (typeof root === 'object') {
+                // 常见形态：world_info['书名'] = { entries: [...] }
+                for (const k of Object.keys(root)) {
+                    const v = root[k];
+                    if (v && typeof v === 'object' && Array.isArray(v.entries) && hasShelf(v.entries)) {
+                        out.push({ book: k, bookObj: v, entries: v.entries });
+                        return;
+                    }
+                }
+                for (const k of Object.keys(root)) {
+                    const v = root[k];
+                    if (v && typeof v === 'object') walk(v, depth + 1);
+                }
+            }
+        };
+        for (const r of roots) walk(r, 0);
+        return out[0] || null;
+    }
+
+    // 写条目进平台世界书对象 + saveWorldInfo 落盘。返回 { ok, lines }。
+    async function syncPlatformBook(content, ids) {
+        const lines = [];
+        try {
+            const found = findPlatformShelfBook();
+            if (!found) {
+                lines.push('平台世界书对象里找不到含「可购买衣物库」的书');
+                return { ok: false, lines };
+            }
+            const bookName = found.book || (found.bookObj && (found.bookObj.name || found.bookObj.comment)) || '(未知名)';
+            lines.push('命中平台世界书: ' + bookName + '（' + found.entries.length + ' 条）');
+            // 建/改「已购衣物库」条目（防越权：只碰这一个条目）
+            let entry = found.entries.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
+            if (!entry) {
+                const fakeChar = { character_book: { entries: found.entries } };
+                const built = buildNewPurchasedEntry(fakeChar, content);
+                if (!built) { lines.push('新建条目失败'); return { ok: false, lines }; }
+                let maxUid = -1;
+                for (const e of found.entries) if (e && typeof e.uid === 'number' && e.uid > maxUid) maxUid = e.uid;
+                if (built.uid === undefined) built.uid = maxUid + 1;
+                entry = built;
+                found.entries.push(entry);
+                lines.push('新建「已购衣物库」条目 (uid=' + entry.uid + ')');
+            } else {
+                lines.push('已有「已购衣物库」条目 (uid=' + entry.uid + ')，更新 content');
+            }
+            entry.content = content;
+            // 落盘：平台编辑器就是 saveWorldInfo() 发的 /api/worldinfo/edit
+            const c = getContext();
+            const saved = [];
+            if (c && typeof c.saveWorldInfo === 'function') {
+                try { c.saveWorldInfo(); saved.push('context.saveWorldInfo'); } catch (e) { lines.push('saveWorldInfo 抛错: ' + (e && e.message)); }
+            }
+            // 若书名已知且上面没调成，先 loadWorldInfo 选中该书再保存（部分平台 save 的是编辑器当前书）
+            if (bookName && c && typeof c.loadWorldInfo === 'function' && !saved.length) {
+                try {
+                    await c.loadWorldInfo(bookName);
+                    if (c && typeof c.saveWorldInfo === 'function') {
+                        c.saveWorldInfo();
+                        saved.push('loadWorldInfo+saveWorldInfo');
+                    }
+                } catch (e) { lines.push('loadWorldInfo 兜底异常: ' + (e && e.message)); }
+            }
+            lines.push('已触发落盘: ' + (saved.length ? saved.join(' + ') : '(无可用保存函数，本地备份兜底)'));
+            return { ok: saved.length > 0, lines };
+        } catch (e) {
+            lines.push('异常: ' + String((e && e.message) || e));
+            return { ok: false, lines };
+        }
+    }
+
+    // 把「已购衣物库」content 写入服务器世界书。
+    // 顺序：① 平台世界书对象（window.world_info + saveWorldInfo）——真落盘路；
+    //       ② /api/worldinfo create/edit（标准酒馆兜底，本平台 404 无害）。
+    // 返回 { ok, lines }；不弹 toast，结果进 diag，失败静默（本地备份兜底）。
+    async function syncServerPurchased(content, ids) {
+        const lines = [];
+        const n = Array.isArray(ids) ? ids.length : 0;
+        lines.push('已购库 content ' + (content ? content.length : 0) + ' 字（无编号），' + n + ' 款');
+        // ① 平台世界书对象
+        try {
+            const p = await syncPlatformBook(content, ids);
+            lines.push(...p.lines);
+            if (p.ok) {
+                lines.push('平台世界书写入成功 ✓');
+                return { ok: true, lines };
+            }
+        } catch (e) {
+            lines.push('平台世界书写入异常: ' + String((e && e.message) || e));
+        }
+        // ② 服务器 API 兜底
+        lines.push('（尝试 /api/worldinfo 兜底...）');
+        const now = Date.now();
+        try {
+            let book = '';
+            let shelfEntries = null;
+            if (serverBookCache.book && (now - serverBookCache.at) < 60000) {
+                book = serverBookCache.book;
+                shelfEntries = serverBookCache.entries;
+                lines.push('服务器世界书(缓存): ' + book + '（' + (shelfEntries ? shelfEntries.length : 0) + ' 条）');
+            } else {
+                lines.push('探测服务器世界书...');
+                const shelf = await findServerShelfBook();
+                if (!shelf.ok) {
+                    serverBookCache = { book: '', entries: null, at: now, err: shelf.err };
+                    lines.push('未找到目标书：' + shelf.err);
+                    return { ok: false, lines };
+                }
+                book = shelf.book;
+                shelfEntries = shelf.entries;
+                serverBookCache = { book, entries: shelfEntries, at: now, err: '' };
+                lines.push('命中服务器世界书: ' + book + '（' + shelfEntries.length + ' 条）');
+            }
+            const existing = (shelfEntries || []).find((e) => e && String((e.comment || '') + (e.name || '')).includes('已购衣物库'));
+            // 同等地位：key 继承服务器上「已有衣物库」条目的触发词（换衣/穿着场景同样激活）
+            let inheritKeys = null;
+            const srvHave = (shelfEntries || []).find((e) => e && String((e.comment || '') + (e.name || '')).includes('已有衣物库'));
+            if (srvHave && Array.isArray(srvHave.keys) && srvHave.keys.length) {
+                inheritKeys = JSON.parse(JSON.stringify(srvHave.keys));
+            }
+            // 条目：保留已有条目的其余字段（uid 等），只换 content / keys
+            const entry = Object.assign({}, existing || {}, {
+                comment: '已购衣物库',
+                content: content || '',
+                keys: inheritKeys || (existing && Array.isArray(existing.keys) && existing.keys.length ? existing.keys : ['已购', '衣物', '购买', '购入']),
+            });
+            if (!existing) {
+                const r = await serverApi('POST', 'create', { name: book, data: entry });
+                lines.push('服务器无已购条目 → create: HTTP ' + r.status);
+                if (r.ok) {
+                    const j = await r.json().catch(() => null);
+                    lines.push('create 返回: ' + JSON.stringify(j).slice(0, 120));
+                }
+            } else {
+                const r = await serverApi('POST', 'edit', { name: book, data: entry });
+                lines.push('服务器已有已购条目(uid=' + existing.uid + ') → edit: HTTP ' + r.status);
+            }
+            // 回读验证：已购库 content 不含编号（编号在记账层），用内容比对判断落盘
+            const v = await serverReadBook(book);
+            if (v.ok) {
+                const vp = v.entries.find((e) => e && String((e.comment || '') + (e.name || '')).includes('已购衣物库'));
+                if (vp) {
+                    const localLen = (content || '').length;
+                    const srvLen = (vp.content || '').length;
+                    lines.push('回读验证: 服务器「已购衣物库」存在，内容 ' + (srvLen === localLen ? '与本地一致 ✓' : '长度不一致（服务器 ' + srvLen + ' / 本地 ' + localLen + '）'));
+                    return { ok: srvLen > 0, lines };
+                }
+                lines.push('回读验证: 服务器上没有「已购衣物库」 ✗');
+                return { ok: false, lines };
+            }
+            lines.push('回读验证失败: ' + v.err);
+            return { ok: false, lines };
+        } catch (e) {
+            lines.push('异常: ' + String((e && e.message) || e));
+            return { ok: false, lines };
+        }
+    }
+
+    // 按钮：把已购衣物库写到服务器世界书（手动兜底 + 验证）
     async function writeServerWorldInfoNow() {
         const lines = ['【已购库写入服务器世界书】'];
         try {
@@ -1150,53 +1351,9 @@
             const content = (b && b.content) || (pur && pur.content);
             if (!content) { lines.push('没有已购库内容（先买一件，或点立即同步）'); writeServerResult(lines); return; }
             const ids = (b && Array.isArray(b.purchasedIds)) ? b.purchasedIds : [];
-            const n = ids.length;
-            lines.push('已购库 content ' + content.length + ' 字（无编号），' + n + ' 款');
-
-            lines.push('探测服务器世界书...');
-            const shelf = await findServerShelfBook();
-            if (!shelf.ok) { lines.push('未找到目标书：' + shelf.err); writeServerResult(lines); return; }
-            lines.push('命中服务器世界书: ' + shelf.book + '（' + shelf.entries.length + ' 条）');
-            const shelfE = shelf.entries.find((e) => e && String((e.comment || '') + (e.name || '')).includes('可购买衣物库'));
-            if (shelfE && shelfE.content) lines.push('服务器可购买库长度: ' + shelfE.content.length + ' 字');
-
-            const existing = shelf.entries.find((e) => e && String((e.comment || '') + (e.name || '')).includes('已购衣物库'));
-            // 同等地位：key 继承服务器上「已有衣物库」条目的触发词（换衣/穿着场景同样激活）
-            let inheritKeys = null;
-            const srvHave = shelf.entries.find((e) => e && String((e.comment || '') + (e.name || '')).includes('已有衣物库'));
-            if (srvHave && Array.isArray(srvHave.keys) && srvHave.keys.length) {
-                inheritKeys = JSON.parse(JSON.stringify(srvHave.keys));
-            }
-            // 条目：保留已有条目的其余字段（uid 等），只换 content / keys
-            const entry = Object.assign({}, existing || {}, {
-                comment: '已购衣物库',
-                content,
-                keys: inheritKeys || (existing && Array.isArray(existing.keys) && existing.keys.length ? existing.keys : ['已购', '衣物', '购买', '购入']),
-            });
-            if (!existing) {
-                const r = await serverApi('POST', 'create', { name: shelf.book, data: entry });
-                lines.push('服务器无已购条目 → create: HTTP ' + r.status);
-                if (r.ok) {
-                    const j = await r.json().catch(() => null);
-                    lines.push('create 返回: ' + JSON.stringify(j).slice(0, 120));
-                }
-            } else {
-                const r = await serverApi('POST', 'edit', { name: shelf.book, data: entry });
-                lines.push('服务器已有已购条目(uid=' + existing.uid + ') → edit: HTTP ' + r.status);
-            }
-            // 回读验证
-            const v = await serverReadBook(shelf.book);
-            if (v.ok) {
-                const vp = v.entries.find((e) => e && String((e.comment || '') + (e.name || '')).includes('已购衣物库'));
-                if (vp) {
-                    const vn = ((vp.content || '').match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) || []).length;
-                    lines.push('回读验证: 服务器「已购衣物库」存在，' + vn + ' 款' + (vp.content && /泳【泳03】/.test(vp.content) ? '，含泳03 ✓' : '，不含泳03 ✗'));
-                } else {
-                    lines.push('回读验证: 服务器上没有「已购衣物库」 ✗');
-                }
-            } else {
-                lines.push('回读验证失败: ' + v.err);
-            }
+            const r = await syncServerPurchased(content, ids);
+            lines.push(...r.lines);
+            if (!r.ok) lines.push('写入未完成——详见上方结果');
         } catch (e) {
             lines.push('异常: ' + String((e && e.message) || e));
         }
