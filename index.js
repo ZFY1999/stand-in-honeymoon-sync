@@ -26,7 +26,7 @@
     // 已购库本地备份：云平台若保存不落盘，扩展每次加载从这恢复，保证模型能读到已购库
     const STORAGE_KEY_BACKUP = 'standInHoneyMoonSync_backup_v1';
     const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
-    const SETTINGS_VERSION = '1.1.3';
+    const SETTINGS_VERSION = '1.1.4';
 
     // 诊断记录（设置面板自检显示，不需要 F12 控制台）
     const diag = {
@@ -38,11 +38,18 @@
         lastSyncAt: 0,
         loadReapply: '',     // 最近一次加载恢复的结果
         charPath: '',        // 世界书来源路径
-        eventCalls: 0,       // onMessage 被调次数（判断事件有没有进扩展）
+        eventCalls: 0,       // onMessage 被调次数（事件版本）
         lastEventType: '',   // 最近一次事件类型
         lastEventHadMsg: 0,  // 最近事件携带的消息条数
         recentMessages: [],  // 最近处理的原始消息（截断），自检里对它们跑匹配审计
+        pollChecks: 0,       // 轮询检查次数
+        pollHits: 0,         // 轮询发现聊天增长（抓到新消息）的次数
+        pollAdded: '',       // 轮询累计追加的款式
     };
+
+    // 轮询状态：事件系统不可靠（云平台可能不发 MESSAGE_RECEIVED），靠 chat.length 变化兜底。
+    let pollTimer = null;
+    let lastWatchKey = '';   // 上次记录的 (角色标识:聊天长度)，用于检测新消息
     function fmtTime(ts) {
         if (!ts) return '';
         try { return new Date(ts).toLocaleTimeString('zh-CN', { hour12: false }); } catch (e) { return String(ts); }
@@ -339,7 +346,48 @@
         return entry;
     }
 
-    function handleMessages(messages) {
+    // --- 轮询兜底：云平台事件系统可能不触发 MESSAGE_RECEIVED，靠 chat.length 变化捕获新消息 ---
+    // 只分析"新增"的消息，不重扫历史。事件照常监听（双保险），轮询是兜底。
+    function watchChat() {
+        diag.pollChecks++;
+        if (!extensionEnabled) return;
+        const c = getContext();
+        if (!c || !Array.isArray(c.chat)) return;
+        const id = c.characterId;
+        const key = String(id) + ':' + c.chat.length;
+        if (!lastWatchKey) {
+            lastWatchKey = key; // 首次只记录基线，不分析历史
+            return;
+        }
+        const sep = lastWatchKey.lastIndexOf(':');
+        const lastId = lastWatchKey.slice(0, sep);
+        const lastLen = parseInt(lastWatchKey.slice(sep + 1), 10) || 0;
+        if (String(id) !== lastId) {
+            lastWatchKey = key; // 切角色，重置基线
+            return;
+        }
+        if (c.chat.length > lastLen) {
+            const newMsgs = c.chat.slice(lastLen);
+            lastWatchKey = key;
+            diag.pollHits++;
+            diag.pollAdded = '';
+            handleMessages(newMsgs, true);
+            if (diag.pollAdded) log('轮询捕获新消息并同步: ' + diag.pollAdded);
+        } else if (c.chat.length < lastLen) {
+            lastWatchKey = key; // 聊天被清空/切换，重置基线
+        }
+    }
+
+    function startPolling() {
+        if (pollTimer) return;
+        try {
+            pollTimer = setInterval(watchChat, 1500);
+        } catch (e) {
+            log('轮询启动失败：', e);
+        }
+    }
+
+    function handleMessages(messages, fromPoll) {
         if (!extensionEnabled) return; // 设置里关了总开关则跳过
         const context = getContext();
         if (!context) return;
@@ -390,6 +438,7 @@
         diag.lastAdded = added.join('、');
         diag.lastSyncAt = Date.now();
         diag.charPath = path;
+        if (fromPoll) diag.pollAdded = added.join('、');
         writeBackup(char.name, content); // 无论平台是否落盘，本地备份先存
 
         // 保存：多路探测保存接口，任一路成功即可（云酒馆/fork 的 getContext 挂载不一致）。
@@ -659,6 +708,12 @@
             lines.push('最近事件类型: ' + (diag.lastEventType || '(无)'));
             lines.push('最近事件携带消息数: ' + diag.lastEventHadMsg);
 
+            lines.push('[轮询]');
+            lines.push('轮询运行: ' + (pollTimer ? '是' : '否'));
+            lines.push('检查次数: ' + diag.pollChecks);
+            lines.push('发现新增批次: ' + diag.pollHits);
+            lines.push('轮询追加款式: ' + (diag.pollAdded || '(尚无)'));
+
             lines.push('[角色世界书]');
             const target = c ? getTargetCharacter(c) : null;
             if (!target) {
@@ -784,6 +839,7 @@
         }
         log('扩展已加载，监听购买场景。');
         exposeDebug();
+        startPolling(); // 轮询兜底：不依赖平台事件系统
         scheduleReapply(); // 页面加载后按重试节奏尝试恢复本地备份
         initSettingsPanel();
     }
