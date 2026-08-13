@@ -26,7 +26,7 @@
     // 已购库本地备份：云平台若保存不落盘，扩展每次加载从这恢复，保证模型能读到已购库
     const STORAGE_KEY_BACKUP = 'standInHoneyMoonSync_backup_v1';
     const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
-    const SETTINGS_VERSION = '1.1.2';
+    const SETTINGS_VERSION = '1.1.3';
 
     // 诊断记录（设置面板自检显示，不需要 F12 控制台）
     const diag = {
@@ -38,6 +38,10 @@
         lastSyncAt: 0,
         loadReapply: '',     // 最近一次加载恢复的结果
         charPath: '',        // 世界书来源路径
+        eventCalls: 0,       // onMessage 被调次数（判断事件有没有进扩展）
+        lastEventType: '',   // 最近一次事件类型
+        lastEventHadMsg: 0,  // 最近事件携带的消息条数
+        recentMessages: [],  // 最近处理的原始消息（截断），自检里对它们跑匹配审计
     };
     function fmtTime(ts) {
         if (!ts) return '';
@@ -428,15 +432,16 @@
 
     // 加载时恢复：若平台没把已购库持久化（常见于云酒馆），从本地备份重新注入内存，
     // 保证本次会话的模型能读到已购衣物库。若平台已持久化（内存里有条目），以平台版本为准并刷新备份。
+    // 返回 true 表示完成（无论是否恢复）；返回 false 表示还没准备好（无角色/无世界书），由调用方重试。
     function reapplyOnLoad() {
         try {
             const context = getContext();
-            if (!context) { diag.loadReapply = 'getContext 不可用'; return; }
+            if (!context) { diag.loadReapply = 'getContext 不可用'; return false; }
             const target = getTargetCharacter(context);
-            if (!target) { diag.loadReapply = '未找到目标角色'; return; }
+            if (!target) { diag.loadReapply = '未找到目标角色'; return false; }
             const { char } = target;
             const { cb, path } = resolveCharBook(char);
-            if (!cb) { diag.loadReapply = '未找到世界书'; return; }
+            if (!cb) { diag.loadReapply = '未找到世界书'; return false; }
             diag.charPath = path;
             const entries = cb.entries;
             const existing = entries.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
@@ -444,7 +449,7 @@
             if (existing) {
                 refreshBackup(char.name, existing.content);
                 diag.loadReapply = '内存已有已购衣物库，采用平台版本（已刷新本地备份）';
-                return;
+                return true;
             }
             if (b && b.content) {
                 const entry = buildNewPurchasedEntry(char, b.content);
@@ -452,18 +457,21 @@
                     diag.loadReapply = `从本地备份恢复已购衣物库（${entry.content.length} 字）`;
                     log('从本地备份恢复「已购衣物库」条目');
                     saveCharacterSafe(context, target.index, char);
-                } else {
-                    diag.loadReapply = '备份存在但重建条目失败';
+                    return true;
                 }
+                diag.loadReapply = '备份存在但重建条目失败';
             } else {
                 diag.loadReapply = '无备份可恢复（正常，尚未购买）';
             }
+            return true;
         } catch (e) {
             diag.loadReapply = '异常: ' + (e && e.message);
+            return false;
         }
     }
 
     function onMessage(...args) {
+        diag.eventCalls++;
         let messages = [];
         const chatArg = args[0];
         if (Array.isArray(chatArg) && chatArg.length) {
@@ -471,10 +479,16 @@
             const idx =
                 typeof idArg === 'number' && idArg >= 0 ? idArg : chatArg.length - 1;
             messages = chatArg.slice(Math.max(0, idx - 3), idx + 1);
+            diag.lastEventHadMsg = messages.length;
         } else {
             const c = getContext();
             if (c && Array.isArray(c.chat)) messages = c.chat.slice(-3);
+            diag.lastEventHadMsg = messages.length;
         }
+        diag.recentMessages = messages.slice(-5).map((m) => ({
+            role: m && m.role,
+            text: m && typeof m.message === 'string' ? m.message.slice(0, 100) : '',
+        }));
         try {
             handleMessages(messages);
         } catch (e) {
@@ -636,8 +650,14 @@
                 lines.push('characters 数量: ' + chars.length);
                 lines.push('characterId: ' + c.characterId);
                 const cur = typeof c.characterId === 'number' ? chars[c.characterId] : null;
-                lines.push('当前角色: ' + (cur && cur.name ? cur.name : '(null)'));
+                const curName = cur ? (cur.name || (cur.data && cur.data.name) || '(null)') : '(null)';
+                lines.push('当前角色: ' + curName);
             }
+
+            lines.push('[事件]');
+            lines.push('onMessage 被调次数: ' + diag.eventCalls);
+            lines.push('最近事件类型: ' + (diag.lastEventType || '(无)'));
+            lines.push('最近事件携带消息数: ' + diag.lastEventHadMsg);
 
             lines.push('[角色世界书]');
             const target = c ? getTargetCharacter(c) : null;
@@ -647,6 +667,7 @@
                 const { cb, path } = resolveCharBook(target.char);
                 diag.charPath = path;
                 const entries = (cb && cb.entries) || [];
+                lines.push('目标角色: ' + (target.char.name || (target.char.data && target.char.data.name) || '?'));
                 lines.push('来源路径: ' + (path || '未找到'));
                 lines.push('entries 总数: ' + entries.length);
                 const shelf = entries.find((e) => e && e.comment && String(e.comment).includes('可购买衣物库'));
@@ -658,6 +679,29 @@
                     const matches = pur.content.match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g);
                     lines.push('内存已购库款式数: ' + (matches ? matches.length : 0) + (matches ? '（' + matches.join('、') + '）' : ''));
                 }
+
+                // 购买链路测试：对当前可购买库跑一条标准购买消息
+                if (shelf && shelf.content) {
+                    lines.push('[购买链路测试]');
+                    const titles = parseShelfTitles(shelf.content);
+                    lines.push('可购买库款式总数: ' + titles.length);
+                    const sample = '我要买泳03';
+                    const hits = analyzeMessage(sample, titles);
+                    if (hits.length) {
+                        const b = extractItemBlock(shelf.content, hits[0].cat, hits[0].num);
+                        lines.push('发 "' + sample + '" → 命中 ' + hits[0].id + '，切块长度 ' + (b ? b.length : 0) + ' 字 → 会追加 ✓');
+                    } else {
+                        lines.push('发 "' + sample + '" → 未命中（可购买库或消息格式有变）✗');
+                    }
+                    // 最近消息审计
+                    if (diag.recentMessages.length) {
+                        lines.push('[最近消息审计]');
+                        for (const m of diag.recentMessages) {
+                            const h = analyzeMessage(m.text || '', titles);
+                            lines.push((m.role || '?') + ': ' + JSON.stringify((m.text || '').slice(0, 40)) + ' → ' + (h.length ? ('命中 ' + h.map(x => x.id).join(',')) : '未命中'));
+                        }
+                    }
+                }
             }
 
             lines.push('[保存]');
@@ -667,7 +711,7 @@
             lines.push('上次保存错误: ' + (diag.lastSaveError || '(无)'));
 
             lines.push('[本地备份]');
-            const charName = target && target.char ? target.char.name : (c && c.characterId >= 0 && c.characters && c.characters[c.characterId] ? c.characters[c.characterId].name : '');
+            const charName = target && target.char ? (target.char.name || (target.char.data && target.char.data.name)) : '';
             const b = charName ? backupFor(charName) : null;
             if (b) {
                 lines.push('备份含当前角色: 是');
@@ -691,7 +735,7 @@
         return lines.join('\n');
     }
 
-    // 调试钩子：F12 可跑 window.__sihsDebug.reapplyOnLoad() / getDiag() / getBackup()
+    // 调试钩子：F12 可跑 window.__sihsDebug.reapplyOnLoad() / getDiag() / getBackup() / testPurchase(text)
     function exposeDebug() {
         try {
             window.__sihsDebug = {
@@ -699,6 +743,22 @@
                 getDiag: () => ({ diag, selfCheck: runSelfCheck() }),
                 getBackup: () => loadBackup(),
                 forceSync: forceSyncNow,
+                // 测试任意购买消息：返回命中+切块结果（不改任何数据）
+                testPurchase: (text) => {
+                    const c = getContext();
+                    const t = c ? getTargetCharacter(c) : null;
+                    if (!t) return '未找到目标角色';
+                    const { cb } = resolveCharBook(t.char);
+                    const shelf = cb && cb.entries.find((e) => e && e.comment && String(e.comment).includes('可购买衣物库'));
+                    if (!shelf) return '未找到可购买库';
+                    const titles = parseShelfTitles(shelf.content);
+                    const hits = analyzeMessage(text || '', titles);
+                    if (!hits.length) return '未命中（text=' + JSON.stringify(text) + '）';
+                    return hits.map((h) => {
+                        const b = extractItemBlock(shelf.content, h.cat, h.num);
+                        return h.id + '(' + h.by + ') 切块' + (b ? b.length : 0) + '字';
+                    }).join('; ');
+                },
             };
         } catch (e) { /* ignore */ }
     }
@@ -706,17 +766,37 @@
     function init() {
         loadExtensionEnabled();
         if (eventSource && event_types) {
-            eventSource.on(event_types.MESSAGE_RECEIVED, onMessage);
-            eventSource.on(event_types.MESSAGE_SENT, onMessage);
+            eventSource.on(event_types.MESSAGE_RECEIVED, function () {
+                diag.lastEventType = 'MESSAGE_RECEIVED';
+                onMessage.apply(null, arguments);
+            });
+            eventSource.on(event_types.MESSAGE_SENT, function () {
+                diag.lastEventType = 'MESSAGE_SENT';
+                onMessage.apply(null, arguments);
+            });
             if (event_types.CHARACTER_LOADED) {
                 // 切角色后重新恢复（防平台保存不落盘）
-                eventSource.on(event_types.CHARACTER_LOADED, () => setTimeout(reapplyOnLoad, 300));
+                eventSource.on(event_types.CHARACTER_LOADED, () => scheduleReapply());
+            }
+            if (event_types.APP_READY) {
+                eventSource.on(event_types.APP_READY, () => scheduleReapply());
             }
         }
         log('扩展已加载，监听购买场景。');
         exposeDebug();
-        setTimeout(reapplyOnLoad, 400); // 页面加载后尝试恢复本地备份
+        scheduleReapply(); // 页面加载后按重试节奏尝试恢复本地备份
         initSettingsPanel();
+    }
+
+    // 重试恢复：characters 可能还没加载完，最多试 20 次（每次 1.2s）。
+    function scheduleReapply() {
+        let tries = 0;
+        const tryApply = () => {
+            const ok = reapplyOnLoad();
+            if (ok || tries++ >= 20) return;
+            setTimeout(tryApply, 1200);
+        };
+        setTimeout(tryApply, 400);
     }
 
     init();
