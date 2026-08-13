@@ -23,8 +23,51 @@
 
     const PREFIX = '[已购衣物同步]';
     const STORAGE_KEY_ENABLED = 'standInHoneyMoonSync_enabled_v1';
+    // 已购库本地备份：云平台若保存不落盘，扩展每次加载从这恢复，保证模型能读到已购库
+    const STORAGE_KEY_BACKUP = 'standInHoneyMoonSync_backup_v1';
     const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
-    const SETTINGS_VERSION = '1.1.1';
+    const SETTINGS_VERSION = '1.1.2';
+
+    // 诊断记录（设置面板自检显示，不需要 F12 控制台）
+    const diag = {
+        lastSaveFound: [],   // 探测到的保存接口名
+        lastSaveMethod: '',  // 实际调用到的保存接口
+        lastSaveError: '',   // 保存抛错信息
+        lastSaveAt: 0,
+        lastAdded: '',       // 上次同步的款式
+        lastSyncAt: 0,
+        loadReapply: '',     // 最近一次加载恢复的结果
+        charPath: '',        // 世界书来源路径
+    };
+    function fmtTime(ts) {
+        if (!ts) return '';
+        try { return new Date(ts).toLocaleTimeString('zh-CN', { hour12: false }); } catch (e) { return String(ts); }
+    }
+
+    // --- 已购库本地备份（localStorage） ---
+    // 结构：{ [角色名]: { content: <已购衣物库 content>, updatedAt: <ts> } }
+    function loadBackup() {
+        try { return JSON.parse(localStorage.getItem(STORAGE_KEY_BACKUP)) || {}; } catch (e) { return {}; }
+    }
+    function saveBackup(map) {
+        try { localStorage.setItem(STORAGE_KEY_BACKUP, JSON.stringify(map)); } catch (e) { /* ignore */ }
+    }
+    function backupFor(charName) {
+        return loadBackup()[charName] || null;
+    }
+    function writeBackup(charName, content) {
+        const map = loadBackup();
+        map[charName] = { content, updatedAt: Date.now() };
+        saveBackup(map);
+    }
+    function refreshBackup(charName, content) {
+        const map = loadBackup();
+        const b = map[charName];
+        if (!b || b.content !== content) {
+            map[charName] = { content, updatedAt: Date.now() };
+            saveBackup(map);
+        }
+    }
 
     // 角色世界书解析：兼容不同平台/卡结构。
     // 标准 SillyTavern 处理后角色对象把 world 摊在顶层 character_book；
@@ -340,30 +383,84 @@
         if (!changed) return;
         purchasedEntry.content = content;
 
+        diag.lastAdded = added.join('、');
+        diag.lastSyncAt = Date.now();
+        diag.charPath = path;
+        writeBackup(char.name, content); // 无论平台是否落盘，本地备份先存
+
         // 保存：多路探测保存接口，任一路成功即可（云酒馆/fork 的 getContext 挂载不一致）。
         // 优先标准 context.saveCharacterDebounced，其次全局 saveCharacterDebounced(index,char)。
         if (!saveCharacterSafe(context, index, char)) {
-            log('保存角色失败：找不到可用的保存接口（请手动保存角色）');
-            showToast('warning', '已写入内存但自动保存失败，请手动保存角色');
+            log('保存角色失败：找不到可用的保存接口（本地备份已存，下次加载自动恢复）');
+            showToast('warning', '自动保存失败：已存本地备份，下次打开自动恢复已购库');
         } else {
             log(`已购衣物已同步：${added.join('、')}`);
         }
     }
 
     // 多路保存：新版 context.saveCharacterDebounced / 旧版全局 saveCharacterDebounced(index,char)。
+    // 记录诊断：哪些接口存在、实际调到哪一路、是否抛错。
     function saveCharacterSafe(context, index, char) {
-        const candidates = [];
+        diag.lastSaveFound = [];
+        diag.lastSaveError = '';
+        const attempts = [];
         if (context && typeof context.saveCharacterDebounced === 'function') {
-            candidates.push(() => context.saveCharacterDebounced());
+            attempts.push(['context.saveCharacterDebounced', () => context.saveCharacterDebounced()]);
         }
         const g1 = (window.SillyTavern && typeof window.SillyTavern.saveCharacterDebounced === 'function') ? window.SillyTavern.saveCharacterDebounced : null;
         const g2 = (typeof window.saveCharacterDebounced === 'function') ? window.saveCharacterDebounced : null;
         const fallback = g1 || g2;
-        if (fallback) candidates.push(() => fallback(index, char));
-        for (const fn of candidates) {
-            try { fn(); return true; } catch (e) { /* 试下一路 */ }
+        if (fallback) attempts.push(['window.saveCharacterDebounced', () => fallback(index, char)]);
+        diag.lastSaveFound = attempts.map((a) => a[0]);
+        for (const [name, fn] of attempts) {
+            try {
+                fn();
+                diag.lastSaveMethod = name;
+                diag.lastSaveAt = Date.now();
+                return true;
+            } catch (e) {
+                diag.lastSaveError = name + ': ' + (e && e.message);
+            }
         }
-        return false; // 有候选但全抛错 → 由上层提示手动保存
+        diag.lastSaveMethod = '';
+        return false; // 有候选但全抛错 → 由上层提示（本地备份兜底）
+    }
+
+    // 加载时恢复：若平台没把已购库持久化（常见于云酒馆），从本地备份重新注入内存，
+    // 保证本次会话的模型能读到已购衣物库。若平台已持久化（内存里有条目），以平台版本为准并刷新备份。
+    function reapplyOnLoad() {
+        try {
+            const context = getContext();
+            if (!context) { diag.loadReapply = 'getContext 不可用'; return; }
+            const target = getTargetCharacter(context);
+            if (!target) { diag.loadReapply = '未找到目标角色'; return; }
+            const { char } = target;
+            const { cb, path } = resolveCharBook(char);
+            if (!cb) { diag.loadReapply = '未找到世界书'; return; }
+            diag.charPath = path;
+            const entries = cb.entries;
+            const existing = entries.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
+            const b = backupFor(char.name);
+            if (existing) {
+                refreshBackup(char.name, existing.content);
+                diag.loadReapply = '内存已有已购衣物库，采用平台版本（已刷新本地备份）';
+                return;
+            }
+            if (b && b.content) {
+                const entry = buildNewPurchasedEntry(char, b.content);
+                if (entry) {
+                    diag.loadReapply = `从本地备份恢复已购衣物库（${entry.content.length} 字）`;
+                    log('从本地备份恢复「已购衣物库」条目');
+                    saveCharacterSafe(context, target.index, char);
+                } else {
+                    diag.loadReapply = '备份存在但重建条目失败';
+                }
+            } else {
+                diag.loadReapply = '无备份可恢复（正常，尚未购买）';
+            }
+        } catch (e) {
+            diag.loadReapply = '异常: ' + (e && e.message);
+        }
     }
 
     function onMessage(...args) {
@@ -461,6 +558,18 @@
         const $sync = panel.querySelector('#sihs-force-sync');
         if ($sync) $sync.addEventListener('click', forceSyncNow);
 
+        const $diag = panel.querySelector('#sihs-self-check');
+        if ($diag) {
+            $diag.addEventListener('click', () => {
+                const pre = panel.querySelector('#sihs-diag-pre');
+                if (!pre) return;
+                const text = runSelfCheck();
+                pre.textContent = text;
+                pre.style.display = 'block';
+                showToast('info', '自检完成，结果已显示（复制发给暮蝶）');
+            });
+        }
+
         const $gh = panel.querySelector('#sihs-open-github');
         if ($gh) {
             $gh.addEventListener('click', () => {
@@ -512,13 +621,101 @@
         setTimeout(updateSettingsStatus, 300);
     }
 
+    // --- 自检诊断（设置面板按钮，不需要 F12 控制台） ---
+
+    function runSelfCheck() {
+        const lines = [];
+        try {
+            const context = getContext();
+            const c = context ? context : null;
+            lines.push('=== 已购衣物同步 自检 ===');
+            lines.push('[环境]');
+            lines.push('getContext: ' + (c ? '可用' : '缺失'));
+            if (c) {
+                const chars = c.characters || [];
+                lines.push('characters 数量: ' + chars.length);
+                lines.push('characterId: ' + c.characterId);
+                const cur = typeof c.characterId === 'number' ? chars[c.characterId] : null;
+                lines.push('当前角色: ' + (cur && cur.name ? cur.name : '(null)'));
+            }
+
+            lines.push('[角色世界书]');
+            const target = c ? getTargetCharacter(c) : null;
+            if (!target) {
+                lines.push('目标角色: 未找到带「可购买衣物库」的角色');
+            } else {
+                const { cb, path } = resolveCharBook(target.char);
+                diag.charPath = path;
+                const entries = (cb && cb.entries) || [];
+                lines.push('来源路径: ' + (path || '未找到'));
+                lines.push('entries 总数: ' + entries.length);
+                const shelf = entries.find((e) => e && e.comment && String(e.comment).includes('可购买衣物库'));
+                lines.push('可购买库: ' + (shelf ? '有（' + (shelf.content ? shelf.content.length : 0) + ' 字）' : '无'));
+                const pur = entries.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
+                lines.push('已购衣物库(内存): ' + (pur ? '已创建（' + (pur.content ? pur.content.length : 0) + ' 字）' : '无'));
+                if (pur && pur.content) {
+                    lines.push('内存已购库含泳03: ' + (/泳【泳03】/.test(pur.content) ? '是' : '否'));
+                    const matches = pur.content.match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g);
+                    lines.push('内存已购库款式数: ' + (matches ? matches.length : 0) + (matches ? '（' + matches.join('、') + '）' : ''));
+                }
+            }
+
+            lines.push('[保存]');
+            lines.push('上次同步: ' + (diag.lastAdded || '(尚无)') + (diag.lastSyncAt ? ' @ ' + fmtTime(diag.lastSyncAt) : ''));
+            lines.push('探测到的保存接口: ' + (diag.lastSaveFound.length ? diag.lastSaveFound.join(', ') : '(无)'));
+            lines.push('上次调用路径: ' + (diag.lastSaveMethod || '(无)') + (diag.lastSaveAt ? ' @ ' + fmtTime(diag.lastSaveAt) : ''));
+            lines.push('上次保存错误: ' + (diag.lastSaveError || '(无)'));
+
+            lines.push('[本地备份]');
+            const charName = target && target.char ? target.char.name : (c && c.characterId >= 0 && c.characters && c.characters[c.characterId] ? c.characters[c.characterId].name : '');
+            const b = charName ? backupFor(charName) : null;
+            if (b) {
+                lines.push('备份含当前角色: 是');
+                lines.push('备份内容长度: ' + (b.content ? b.content.length : 0));
+                lines.push('备份含泳03: ' + (b.content && /泳【泳03】/.test(b.content) ? '是' : '否'));
+                const m = b.content ? b.content.match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) : null;
+                lines.push('备份款式数: ' + (m ? m.length : 0));
+                lines.push('备份时间: ' + fmtTime(b.updatedAt));
+            } else {
+                lines.push('备份含当前角色: 否');
+            }
+
+            lines.push('[加载恢复]');
+            lines.push('最近一次: ' + (diag.loadReapply || '(尚未执行)'));
+
+            lines.push('[面板状态]');
+            lines.push('启用开关: ' + (extensionEnabled ? '开' : '关'));
+        } catch (e) {
+            lines.push('自检异常: ' + (e && e.message));
+        }
+        return lines.join('\n');
+    }
+
+    // 调试钩子：F12 可跑 window.__sihsDebug.reapplyOnLoad() / getDiag() / getBackup()
+    function exposeDebug() {
+        try {
+            window.__sihsDebug = {
+                reapplyOnLoad: () => { reapplyOnLoad(); return runSelfCheck(); },
+                getDiag: () => ({ diag, selfCheck: runSelfCheck() }),
+                getBackup: () => loadBackup(),
+                forceSync: forceSyncNow,
+            };
+        } catch (e) { /* ignore */ }
+    }
+
     function init() {
         loadExtensionEnabled();
         if (eventSource && event_types) {
             eventSource.on(event_types.MESSAGE_RECEIVED, onMessage);
             eventSource.on(event_types.MESSAGE_SENT, onMessage);
+            if (event_types.CHARACTER_LOADED) {
+                // 切角色后重新恢复（防平台保存不落盘）
+                eventSource.on(event_types.CHARACTER_LOADED, () => setTimeout(reapplyOnLoad, 300));
+            }
         }
         log('扩展已加载，监听购买场景。');
+        exposeDebug();
+        setTimeout(reapplyOnLoad, 400); // 页面加载后尝试恢复本地备份
         initSettingsPanel();
     }
 
