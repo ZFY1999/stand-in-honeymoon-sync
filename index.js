@@ -1573,26 +1573,31 @@
             const rg = await serverGetBook(bookName);
             if (!rg.ok) { lines.push('读书失败: ' + rg.err); return { ok: false, lines }; }
             const book = rg.book;
-            const entries = entriesToMap(book.entries);
+            // ⚠ 保持服务器原始 entries 格式（数组 or map）不动——直接改 entry.content 再原样传回 edit。
+            //   之前强制 book.entries = entriesToMap(...) 把数组换成 map，平台不认导致 edit 200 但 content 没落盘。
+            const isArr = Array.isArray(book.entries);
+            lines.push('服务器 entries 格式: ' + (isArr ? '数组(' + book.entries.length + '条)' : (book.entries && typeof book.entries === 'object' ? 'map(uid键,' + Object.keys(book.entries).length + '条)' : String(typeof book.entries))));
             const shelfE = findEntryByComment(book, '可购买衣物库');
             let pur = findEntryByComment(book, '已购衣物库');
             if (!pur) {
                 // 照可购买库条目克隆字段（cloneKeyField：全局书用 key、代替蜜月用 keys），换 uid/comment/content
                 const uid = nextFreeUid(book);
                 if (uid === null) { lines.push('分配 uid 失败'); return { ok: false, lines }; }
-                pur = Object.assign({}, shelfE || {}, {
+                const newEntry = Object.assign({}, shelfE || {}, {
                     uid,
                     comment: '已购衣物库',
                     content: content || '',
                     key: cloneKeyField(shelfE),
                 });
-                entries[uid] = pur;
+                // 按原格式插入：数组 push / map 按 uid 赋值
+                if (isArr) book.entries.push(newEntry);
+                else if (book.entries && typeof book.entries === 'object') book.entries[uid] = newEntry;
+                else book.entries = { [uid]: newEntry };
                 lines.push('新建「已购衣物库」条目 (uid=' + uid + ')');
             } else {
                 pur.content = content || '';
                 lines.push('更新「已购衣物库」条目 (uid=' + pur.uid + ')');
             }
-            book.entries = entries;
             const save = await serverApi('POST', 'edit', { name: bookName, data: book });
             lines.push('edit 落盘: HTTP ' + save.status);
             // 刷新前端世界书缓存/编辑台（即时显示，不用手动刷新页面）
@@ -1702,12 +1707,11 @@
             const rg = await serverGetBook(bookName);
             if (!rg.ok) { lines.push('服务器读书失败: ' + rg.err); return { ok: false, lines }; }
             const book = rg.book;
-            const entries = entriesToMap(book.entries);
+            // ⚠ 保持服务器原始 entries 格式（数组 or map）不动——直接改 content 原样传回 edit
             const pur = findEntryByComment(book, '已购衣物库');
             if (!pur) { lines.push('服务器书里没有「已购衣物库」条目，无需清'); return { ok: true, lines }; }
             const had = (pur.content || '').match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) || [];
             pur.content = PURCHASED_TEMPLATE;
-            book.entries = entries;
             const save = await serverApi('POST', 'edit', { name: bookName, data: book });
             lines.push('服务器 edit 落盘: HTTP ' + save.status + '（清掉 ' + (had.length || 0) + ' 款索引）');
             await notifyWorldInfoRefreshed(bookName, book, false);
