@@ -26,7 +26,7 @@
     // 已购库本地备份：云平台若保存不落盘，扩展每次加载从这恢复，保证模型能读到已购库
     const STORAGE_KEY_BACKUP = 'standInHoneyMoonSync_backup_v1';
     const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
-    const SETTINGS_VERSION = '1.2.0';
+    const SETTINGS_VERSION = '1.2.1';
 
     // 诊断记录（设置面板自检显示，不需要 F12 控制台）
     const diag = {
@@ -461,19 +461,27 @@
         }
     }
 
-    // 多路保存：新版 context.saveCharacterDebounced / 旧版全局 saveCharacterDebounced(index,char)。
+    // 多路保存：穷举 context / window / SillyTavern 上所有可能的保存接口，挨个试。
     // 记录诊断：哪些接口存在、实际调到哪一路、是否抛错。
     function saveCharacterSafe(context, index, char) {
         diag.lastSaveFound = [];
         diag.lastSaveError = '';
         const attempts = [];
-        if (context && typeof context.saveCharacterDebounced === 'function') {
-            attempts.push(['context.saveCharacterDebounced', () => context.saveCharacterDebounced()]);
+        // 1) context 上的保存方法（无参变体，保存当前角色）
+        const ctxKeys = ['saveCharacterDebounced', 'saveCharacter', 'saveCharacterCard', 'saveCharacterSettings'];
+        for (const k of ctxKeys) {
+            if (context && typeof context[k] === 'function') {
+                attempts.push(['context.' + k, () => context[k]()]);
+            }
         }
-        const g1 = (window.SillyTavern && typeof window.SillyTavern.saveCharacterDebounced === 'function') ? window.SillyTavern.saveCharacterDebounced : null;
-        const g2 = (typeof window.saveCharacterDebounced === 'function') ? window.saveCharacterDebounced : null;
-        const fallback = g1 || g2;
-        if (fallback) attempts.push(['window.saveCharacterDebounced', () => fallback(index, char)]);
+        // 2) window / SillyTavern 全局保存方法（带参：index, char）
+        const globals = ['saveCharacterDebounced', 'saveCharacter', 'saveCharacterCard'];
+        for (const k of globals) {
+            const f1 = window.SillyTavern && typeof window.SillyTavern[k] === 'function' ? window.SillyTavern[k] : null;
+            const f2 = typeof window[k] === 'function' ? window[k] : null;
+            const fn = f1 || f2;
+            if (fn) attempts.push(['window.' + k, () => fn(index, char)]);
+        }
         diag.lastSaveFound = attempts.map((a) => a[0]);
         for (const [name, fn] of attempts) {
             try {
@@ -505,15 +513,29 @@
             const entries = cb.entries;
             const existing = entries.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
             const b = backupFor(char.name);
+            const countItems = (s) => { const m = s ? s.match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) : null; return m ? m.length : 0; };
             if (existing) {
+                if (countItems(existing.content) > 0) {
+                    refreshBackup(char.name, existing.content);
+                    diag.loadReapply = '内存已有已购衣物库（含款式），采用平台版本';
+                    return true;
+                }
+                // 平台持久化了"空条目"：若备份有货，用备份覆盖（否则泳03 永远被空壳盖住）
+                if (b && b.content && countItems(b.content) > 0) {
+                    existing.content = b.content;
+                    diag.loadReapply = `平台版本为空条目，从备份覆盖恢复（${countItems(b.content)} 款）`;
+                    log('平台版本为空条目，从备份覆盖恢复已购衣物库');
+                    saveCharacterSafe(context, target.index, char);
+                    return true;
+                }
                 refreshBackup(char.name, existing.content);
-                diag.loadReapply = '内存已有已购衣物库，采用平台版本（已刷新本地备份）';
+                diag.loadReapply = '内存已有已购衣物库（空条目），备份无内容可覆盖';
                 return true;
             }
             if (b && b.content) {
                 const entry = buildNewPurchasedEntry(char, b.content);
                 if (entry) {
-                    diag.loadReapply = `从本地备份恢复已购衣物库（${entry.content.length} 字）`;
+                    diag.loadReapply = `从本地备份恢复已购衣物库（${countItems(entry.content)} 款）`;
                     log('从本地备份恢复「已购衣物库」条目');
                     saveCharacterSafe(context, target.index, char);
                     return true;
@@ -773,6 +795,14 @@
             lines.push('探测到的保存接口: ' + (diag.lastSaveFound.length ? diag.lastSaveFound.join(', ') : '(无)'));
             lines.push('上次调用路径: ' + (diag.lastSaveMethod || '(无)') + (diag.lastSaveAt ? ' @ ' + fmtTime(diag.lastSaveAt) : ''));
             lines.push('上次保存错误: ' + (diag.lastSaveError || '(无)'));
+            // 环境里所有带 save 的可调用函数（看云平台到底挂了哪些）
+            const envSave = [];
+            try {
+                if (c) { for (const k of Object.keys(c)) { if (/save/i.test(k) && typeof c[k] === 'function') envSave.push('ctx.' + k); } }
+                if (window.SillyTavern) { for (const k of Object.keys(window.SillyTavern)) { if (/save/i.test(k) && typeof window.SillyTavern[k] === 'function') envSave.push('ST.' + k); } }
+                for (const k of Object.keys(window)) { if (/save/i.test(k) && typeof window[k] === 'function') envSave.push('win.' + k); }
+            } catch (e) { /* ignore */ }
+            lines.push('环境含save的函数: ' + (envSave.length ? Array.from(new Set(envSave)).join(', ') : '(无)'));
 
             lines.push('[本地备份]');
             const charName = target && target.char ? (target.char.name || (target.char.data && target.char.data.name)) : '';
