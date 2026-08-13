@@ -42,6 +42,12 @@
                     <i class="fa-solid fa-arrows-rotate"></i> 立即同步当前聊天
                 </button>
                 <button
+                    id="sihs-self-check"
+                    class="menu_button wide_button"
+                >
+                    <i class="fa-solid fa-stethoscope"></i> 运行自检
+                </button>
+                <button
                     id="sihs-open-github"
                     class="menu_button wide_button"
                 >
@@ -49,11 +55,17 @@
                 </button>
             </div>
 
+            <pre
+                id="sihs-diag-pre"
+                class="description_text"
+                style="display: none; white-space: pre-wrap; word-break: break-all; font-size: 12px; margin-top: 8px; max-height: 260px; overflow-y: auto;"
+            ></pre>
+
             <div
                 class="description_text"
                 style="text-align: center; margin-top: 6px"
             >
-                版本 <span id="sihs-version">1.1.0</span>
+                版本 <span id="sihs-version">1.1.2</span>
             </div>
         </div>
     </div>
