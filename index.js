@@ -23,10 +23,13 @@
 
     const PREFIX = '[暮蝶换衣间]';
     const STORAGE_KEY_ENABLED = 'standInHoneyMoonSync_enabled_v1';
-    // 已购库本地备份：云平台若保存不落盘，扩展每次加载从这恢复，保证模型能读到已购库
-    const STORAGE_KEY_BACKUP = 'standInHoneyMoonSync_backup_v1';
+    // 已购库本地备份：v2 起含 content（无编号，模型可读）+ purchasedIds（编号记账集合，模型读不到）。
+    // 云平台若保存不落盘，扩展每次加载从这恢复，保证模型能读到已购库、防重复对账有据。
+    const STORAGE_KEY_BACKUP = 'standInHoneyMoonSync_backup_v2';
+    // v1 备份（含编号的旧 content + 预置款式）一次性清除，避免 9 款默认衣服回灌。
+    const STORAGE_KEY_BACKUP_V1 = 'standInHoneyMoonSync_backup_v1';
     const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
-    const SETTINGS_VERSION = '1.5.1';
+    const SETTINGS_VERSION = '1.6.0';
 
     // 诊断记录（设置面板自检显示，不需要 F12 控制台）
     const diag = {
@@ -126,12 +129,16 @@
     }
 
     // --- 已购库本地备份（localStorage） ---
-    // 结构：{ [角色名]: { content: <已购衣物库 content>, updatedAt: <ts> } }
+    // 结构：{ [角色名]: { content: <已购衣物库 content，无编号>, purchasedIds: [<泳03>,...], updatedAt: <ts> } }
     function loadBackup() {
         try { return JSON.parse(localStorage.getItem(STORAGE_KEY_BACKUP)) || {}; } catch (e) { return {}; }
     }
     function saveBackup(map) {
         try { localStorage.setItem(STORAGE_KEY_BACKUP, JSON.stringify(map)); } catch (e) { /* ignore */ }
+    }
+    // 升级 v2：清掉 v1 旧备份（含编号 + 预置款式），避免旧数据回灌
+    function migrateBackupV2() {
+        try { localStorage.removeItem(STORAGE_KEY_BACKUP_V1); } catch (e) { /* ignore */ }
     }
     // 角色名键：云平台角色顶层 name 可能为 null，真名在 data.name，统一取第一个非空
     function charNameKey(char) {
@@ -142,16 +149,23 @@
     function backupFor(charName) {
         return loadBackup()[charName] || null;
     }
-    function writeBackup(charName, content) {
+    function writeBackup(charName, content, purchasedIds) {
         const map = loadBackup();
-        map[charName] = { content, updatedAt: Date.now() };
+        map[charName] = {
+            content,
+            purchasedIds: Array.isArray(purchasedIds) ? purchasedIds : [],
+            updatedAt: Date.now(),
+        };
         saveBackup(map);
     }
-    function refreshBackup(charName, content) {
+    function refreshBackup(charName, content, purchasedIds) {
         const map = loadBackup();
         const b = map[charName];
+        const ids = Array.isArray(purchasedIds)
+            ? purchasedIds
+            : (b && Array.isArray(b.purchasedIds) ? b.purchasedIds : []);
         if (!b || b.content !== content) {
-            map[charName] = { content, updatedAt: Date.now() };
+            map[charName] = { content, purchasedIds: ids, updatedAt: Date.now() };
             saveBackup(map);
         }
     }
@@ -199,7 +213,7 @@
         '【已购转移豁免】本条目为已购衣物的【权威清单】：其中衣物已经明确购买并确认获得，不受「可购买衣物库」"未购买视为不存在""绝不允许直接穿着"等防误用约束的限制。',
         '【性质声明】本条目衣物来自「可购买衣物库」，保留其完整设定，包括色情款的【隐藏标记】【实际结构】【动态反应】等隐藏特性。本条目【不适用】「已有衣物库」头部"无色情特性"的约定。',
         '【色情设定隐藏规则延续】角色购买、入手本条目衣物时，仍不知晓其隐藏特性（走光、透明、滑落等）；此类特性只在实际穿着后，经动作或环境（风、水、卧姿、活动）作用时才逐步显现，角色此时略感意外，不会早有预料。规则与「可购买衣物库」完全一致。',
-        '【编号认知】本条目编号（泳/睡/日/内/礼 01-20）为系统记账标记，仅供扩展防重复与设定追踪使用。林婉清及对话产生的NPC均【不知晓】编号，剧情描写一律以款式名称呼衣物，角色台词、旁白、心理描写中不得出现编号。',
+        '【编号认知】本条目衣物一律以款式名记录，内容中不出现编号。编号（泳/睡/日/内/礼 01-20）仅存在于扩展记账层，用于防重复与对账，不进入本条目内容，模型与剧情均读不到编号。林婉清及剧情产生的NPC均【不知晓】编号，剧情描写一律以款式名称呼衣物。',
         '',
         '## 泳衣类',
         '',
@@ -212,9 +226,9 @@
         '## 礼服类',
         '',
         '## 使用说明',
-        '- 本条目由扩展自动维护：购买一件追加一件，按编号防重复，只增不改不删。',
-        '- 追加的款式整块保留原设定文本（款式外观/实际结构/动态反应/隐藏标记等）。',
-        '- 编号仅作记账，角色不知晓编号，剧情中只以款式名指代衣物。',
+        '- 本条目由扩展自动维护：购买一件追加一件，只增不改不删。',
+        '- 追加的款式整块保留原设定文本（款式外观/实际结构/动态反应/隐藏标记等），标题只保留款式名。',
+        '- 编号仅存于扩展记账层，角色与剧情不知晓编号，剧情中只以款式名指代衣物。',
         '',
     ].join('\n');
 
@@ -346,10 +360,14 @@
         return block || null;
     }
 
-    // 已购衣物库是否已存在该编号（防重复）。按块标记「泳【泳03】」判。
-    function isAlreadyPurchased(purchasedContent, cat, num) {
-        if (!purchasedContent) return false;
-        return new RegExp(`${cat}【${cat}${num}】`).test(purchasedContent);
+    // 从块文本剥离编号标记「泳【泳03】」等，只留款式名与设定——模型永远读不到编号。
+    function stripItemIds(block) {
+        return (block || '').replace(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g, '');
+    }
+
+    // 已购衣物库是否已存在该编号（防重复）。编号集合记账于备份 purchasedIds，不依赖 content。
+    function isAlreadyPurchased(purchasedIds, id) {
+        return Array.isArray(purchasedIds) && purchasedIds.includes(id);
     }
 
     // 把衣物块追加进已购衣物库 content 对应分类小节（在「## 分类名」之后、下一分区之前）。
@@ -568,6 +586,9 @@
         }
 
         let content = purchasedEntry.content || '';
+        // 已购编号记账集合：来自本地备份（唯一权威），防重复对账用；模型读不到（不进 content）
+        const b0 = backupFor(charNameKey(char));
+        let purchasedIds = (b0 && Array.isArray(b0.purchasedIds)) ? b0.purchasedIds.slice() : [];
         let changed = false;
         const added = [];
 
@@ -576,7 +597,7 @@
             if (!mtext) continue;
             const buys = analyzeMessage(mtext, shelfTitles);
             for (const b of buys) {
-                if (isAlreadyPurchased(content, b.cat, b.num)) {
+                if (isAlreadyPurchased(purchasedIds, b.id)) {
                     log(`跳过重复：${b.id}`);
                     continue;
                 }
@@ -585,7 +606,11 @@
                     log(`在可购买库找不到 ${b.id} 的完整设定，跳过`);
                     continue;
                 }
-                content = appendItem(content, b.cat, block);
+                // 关键：剥离编号后再进已购库，角色/剧情永远看不到编号
+                const cleanBlock = stripItemIds(block);
+                if (!cleanBlock) continue;
+                content = appendItem(content, b.cat, cleanBlock);
+                purchasedIds.push(b.id);
                 changed = true;
                 added.push(`${b.id}(${b.by === 'title' ? '款式名' : '编号'})`);
             }
@@ -604,7 +629,7 @@
         diag.lastSyncAt = Date.now();
         diag.charPath = path;
         if (fromPoll) diag.pollAdded = added.join('、');
-        writeBackup(charNameKey(char), content); // 无论平台是否落盘，本地备份先存
+        writeBackup(charNameKey(char), content, purchasedIds); // 无论平台是否落盘，本地备份先存
         // 关键：同步到活跃世界书（context.worldInfo）——平台编辑器真正读写的存储
         diag.wiSynced = syncToActiveWorld(context, content);
         if (diag.wiSynced) log('已同步进活跃世界书（context.worldInfo）');
@@ -684,7 +709,7 @@
             const entries = cb.entries;
             const existing = entries.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
             const b = backupFor(charNameKey(char));
-            const countItems = (s) => { const m = s ? s.match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) : null; return m ? m.length : 0; };
+            const backupIds = (b && Array.isArray(b.purchasedIds)) ? b.purchasedIds.slice() : [];
             const restoreContent = (c) => {
                 // 恢复动作：写内存 + 同步进活跃世界书/编辑器活动书 + 保存
                 if (Array.isArray(context.worldInfo) &&
@@ -695,27 +720,32 @@
                 saveCharacterSafe(context, target.index, char);
             };
             if (existing) {
-                if (countItems(existing.content) > 0) {
-                    refreshBackup(charNameKey(char), existing.content);
-                    diag.loadReapply = '内存已有已购衣物库（含款式），采用平台版本';
-                    return true;
-                }
-                // 平台持久化了"空条目"：若备份有货，用备份覆盖（否则泳03 永远被空壳盖住）
-                if (b && b.content && countItems(b.content) > 0) {
-                    existing.content = b.content;
-                    diag.loadReapply = `平台版本为空条目，从备份覆盖恢复（${countItems(b.content)} 款）`;
-                    log('平台版本为空条目，从备份覆盖恢复已购衣物库');
+                // 旧格式迁移：条目 content 若含编号标记（旧版/预置卡遗留），剥离编号并收回记账集合
+                const legacyIds = (existing.content || '').match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g);
+                if (legacyIds && legacyIds.length) {
+                    const ids = legacyIds.map((x) => x.replace(/【|】/g, '').slice(0, 3));
+                    const merged = Array.from(new Set([...backupIds, ...ids]));
+                    existing.content = stripItemIds(existing.content);
+                    refreshBackup(charNameKey(char), existing.content, merged);
+                    diag.loadReapply = `迁移旧格式已购库（剥离编号，记账 ${merged.length} 款）`;
                     restoreContent(existing.content);
                     return true;
                 }
-                refreshBackup(charNameKey(char), existing.content);
-                diag.loadReapply = '内存已有已购衣物库（空条目），备份无内容可覆盖';
+                if (backupIds.length) {
+                    existing.content = b.content;
+                    diag.loadReapply = `从备份覆盖恢复已购衣物库（${backupIds.length} 款）`;
+                    restoreContent(existing.content);
+                    return true;
+                }
+                // 备份空：条目为空白模板，保持干净，只刷新备份
+                refreshBackup(charNameKey(char), existing.content, []);
+                diag.loadReapply = '内存已有已购衣物库（空白模板，无已购记录）';
                 return true;
             }
             if (b && b.content) {
                 const entry = buildNewPurchasedEntry(char, b.content);
                 if (entry) {
-                    diag.loadReapply = `从本地备份恢复已购衣物库（${countItems(entry.content)} 款）`;
+                    diag.loadReapply = `从本地备份恢复已购衣物库（${backupIds.length} 款）`;
                     log('从本地备份恢复「已购衣物库」条目');
                     restoreContent(entry.content);
                     return true;
@@ -894,7 +924,7 @@
                 const hasShelf = entries.some((e) => e && e.comment && String(e.comment).includes('可购买衣物库'));
                 const hasPurchased = entries.some((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
                 const b = backupFor(charNameKey(target.char));
-                const n = b && b.content ? (b.content.match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) || []).length : 0;
+                const n = (b && Array.isArray(b.purchasedIds)) ? b.purchasedIds.length : 0;
                 text = `目标角色：${charNameKey(target.char) || '(无名)'}；已购衣物库：${hasPurchased ? '已创建' : '尚未创建'}（当前 ${n} 款）；世界书来源：${path || '未找到'}。`;
             }
         } catch (e) {
@@ -1116,8 +1146,9 @@
             const b = backupFor(charNameKey(t.char));
             const content = (b && b.content) || (pur && pur.content);
             if (!content) { lines.push('没有已购库内容（先买一件，或点立即同步）'); writeServerResult(lines); return; }
-            const n = (content.match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) || []).length;
-            lines.push('已购库 content ' + content.length + ' 字，' + n + ' 款');
+            const ids = (b && Array.isArray(b.purchasedIds)) ? b.purchasedIds : [];
+            const n = ids.length;
+            lines.push('已购库 content ' + content.length + ' 字（无编号），' + n + ' 款');
 
             lines.push('探测服务器世界书...');
             const shelf = await findServerShelfBook();
@@ -1218,7 +1249,7 @@
             a.click();
             document.body.removeChild(a);
             setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ } }, 3000);
-            const n = (b && b.content) ? (b.content.match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) || []).length : 0;
+            const n = (b && Array.isArray(b.purchasedIds)) ? b.purchasedIds.length : 0;
             showToast('info', '已导出角色卡（含已购衣物库 ' + n + ' 款）→ 去"导入角色"覆盖原角色');
             log('导出角色卡：' + a.download + '（已购库 ' + n + ' 款）');
         } catch (e) {
@@ -1412,10 +1443,16 @@
                 lines.push('可购买库: ' + (shelf ? '有（' + (shelf.content ? shelf.content.length : 0) + ' 字）' : '无'));
                 const pur = entries.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
                 lines.push('已购衣物库(内存): ' + (pur ? '已创建（' + (pur.content ? pur.content.length : 0) + ' 字）' : '无'));
+                // 已购编号记账集合（来自本地备份，模型读不到）
+                const curBackup = backupFor(charNameKey(target.char));
+                const curIds = (curBackup && Array.isArray(curBackup.purchasedIds)) ? curBackup.purchasedIds : [];
+                lines.push('已购编号记账: ' + (curIds.length ? curIds.join('、') : '(空，从空开始)'));
                 if (pur && pur.content) {
-                    lines.push('内存已购库含泳03: ' + (/泳【泳03】/.test(pur.content) ? '是' : '否'));
-                    const matches = pur.content.match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g);
-                    lines.push('内存已购库款式数: ' + (matches ? matches.length : 0) + (matches ? '（' + matches.join('、') + '）' : ''));
+                    lines.push('内存已购库含泳03(记账): ' + (curIds.includes('泳03') ? '是' : '否'));
+                    lines.push('内存已购库款式数: ' + curIds.length);
+                    // 内容是否残留编号（v1.6.0 后应为否）
+                    const leftover = (pur.content.match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) || []).length;
+                    lines.push('已购库内容含编号标记: ' + (leftover ? leftover + ' 处 ⚠ 旧格式' : '否 ✓'));
                 }
 
                 // 购买链路测试：对当前可购买库跑一条标准购买消息
@@ -1483,9 +1520,8 @@
             if (b) {
                 lines.push('备份含当前角色: 是');
                 lines.push('备份内容长度: ' + (b.content ? b.content.length : 0));
-                lines.push('备份含泳03: ' + (b.content && /泳【泳03】/.test(b.content) ? '是' : '否'));
-                const m = b.content ? b.content.match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) : null;
-                lines.push('备份款式数: ' + (m ? m.length : 0));
+                lines.push('备份编号记账: ' + (Array.isArray(b.purchasedIds) ? b.purchasedIds.join('、') : '(无)'));
+                lines.push('备份款式数: ' + (Array.isArray(b.purchasedIds) ? b.purchasedIds.length : 0));
                 lines.push('备份时间: ' + fmtTime(b.updatedAt));
             } else {
                 lines.push('备份含当前角色: 否');
@@ -1570,6 +1606,7 @@
     }
 
     function init() {
+        migrateBackupV2(); // 清旧 v1 备份（含编号+预置款式），从空开始
         installRequestHook(); // 先装保存请求拦截，越早越好
         loadExtensionEnabled();
         if (eventSource && event_types) {
