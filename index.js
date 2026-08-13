@@ -26,7 +26,7 @@
     // 已购库本地备份：云平台若保存不落盘，扩展每次加载从这恢复，保证模型能读到已购库
     const STORAGE_KEY_BACKUP = 'standInHoneyMoonSync_backup_v1';
     const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
-    const SETTINGS_VERSION = '1.3.1';
+    const SETTINGS_VERSION = '1.3.2';
 
     // 诊断记录（设置面板自检显示，不需要 F12 控制台）
     const diag = {
@@ -50,6 +50,7 @@
         charIdChar: '',      // characterId 指向的角色名
         editorSynced: false, // 是否同步进编辑器活动书(characterBook/settings.world_info)
         saveRequests: [],    // 抓到的平台保存/同步请求（fetch + XHR 拦截）
+        wiTestResult: '',    // 写 worldInfo 落盘测试结果
     };
 
     // 轮询状态：事件系统不可靠（云平台可能不发 MESSAGE_RECEIVED），靠 chat.length 变化兜底。
@@ -845,6 +846,11 @@
             $testSave.addEventListener('click', testSaveNow);
         }
 
+        const $writeWi = panel.querySelector('#sihs-write-worldinfo');
+        if ($writeWi) {
+            $writeWi.addEventListener('click', writeWorldInfoNow);
+        }
+
         const $gh = panel.querySelector('#sihs-open-github');
         if ($gh) {
             $gh.addEventListener('click', () => {
@@ -918,6 +924,101 @@
         } catch (e) {
             showToast('error', '测试保存异常：' + (e && e.message));
         }
+    }
+
+    // 写 worldInfo 落盘测试：把已购衣物库条目直接塞进 context.worldInfo（若为数组）再 saveWorldInfo 落盘。
+    // 平台自检显示 context 挂着真 saveWorldInfo 且抓包有 /api/worldinfo/edit → 试这条真落盘路。
+    // 同时把 worldInfo 的类型/是否数组/可否新建/是否含可购买库全打出来，不用控制台也能看。
+    function writeWorldInfoNow() {
+        try {
+            const c = getContext();
+            if (!c) { showToast('warning', 'getContext 不可用'); return; }
+            const t = getTargetCharacter(c);
+            if (!t) { showToast('warning', '未找到目标角色'); return; }
+
+            // 1) 找已购库 content（内存里的）
+            const { cb } = resolveCharBook(t.char);
+            if (!cb) { showToast('error', '目标角色无世界书 data.character_book'); return; }
+            const pur = cb.entries.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
+            if (!pur) { showToast('error', '内存里没有「已购衣物库」条目，先买一件或点立即同步'); return; }
+            const content = pur.content;
+
+            // 2) worldInfo 到底是啥
+            const wiType = c.worldInfo === undefined ? 'undefined' : (Array.isArray(c.worldInfo) ? 'array' : typeof c.worldInfo);
+            const lines = ['【写 worldInfo 落盘测试】', 'worldInfo 类型: ' + wiType];
+            if (c.worldInfo !== undefined && !Array.isArray(c.worldInfo)) {
+                try {
+                    const ks = Object.keys(c.worldInfo || {});
+                    lines.push('worldInfo 对象键: ' + (ks.length ? ks.join(', ') : '(空)'));
+                } catch (e) { /* ignore */ }
+            }
+            if (Array.isArray(c.worldInfo)) {
+                lines.push('worldInfo 数组长度: ' + c.worldInfo.length);
+                const hasShelf = c.worldInfo.some((e) => e && e.comment && String(e.comment).includes('可购买衣物库'));
+                const hasPur = c.worldInfo.some((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
+                lines.push('worldInfo 含可购买库: ' + (hasShelf ? '是' : '否'));
+                lines.push('worldInfo 含已购库: ' + (hasPur ? '是' : '否'));
+                if (!hasShelf && !hasPur) {
+                    // worldInfo 不是代替蜜月的书 → 尝试按"通用书"写入？不，防御：提示别乱写别人的书
+                    lines.push('worldInfo 不含可购买库，不是代替蜜月的角色书 → 不写入，避免污染别的书');
+                    writeWorldInfoResult(lines);
+                    return;
+                }
+            }
+
+            // 3) 塞进去
+            let wrote = false;
+            if (Array.isArray(c.worldInfo)) {
+                // 复用 syncToActiveWorld（写条目 + 调 saveWorldInfo）
+                wrote = syncToActiveWorld(c, content);
+            } else if (c.worldInfo && typeof c.worldInfo === 'object') {
+                // 对象形态：找 entries / data
+                const arrCandidates = [c.worldInfo.entries, c.worldInfo.data, c.worldInfo.world_info];
+                for (const arr of arrCandidates) {
+                    if (Array.isArray(arr) && arr.some((e) => e && e.comment && String(e.comment).includes('可购买衣物库'))) {
+                        const fakeChar = { character_book: { entries: arr } };
+                        const built = buildNewPurchasedEntry(fakeChar, content);
+                        if (built) {
+                            arr.push(built);
+                            wrote = true;
+                            break;
+                        }
+                    }
+                }
+                if (!wrote) lines.push('worldInfo 对象里找不到可购买库条目数组，未写入');
+            }
+            lines.push('写入 worldInfo: ' + (wrote ? '成功' : '未执行'));
+
+            // 4) 落盘
+            if (wrote) {
+                const saveNames = ['saveWorldInfo', 'saveMetadataDebounced', 'saveMetadata', 'saveSettingsDebounced'];
+                const called = [];
+                for (const n of saveNames) {
+                    try { if (typeof c[n] === 'function') { c[n](); called.push(n); } } catch (e) { /* ignore */ }
+                }
+                lines.push('已触发落盘: ' + (called.length ? called.join(' + ') : '(无可用保存函数)'));
+            }
+            writeWorldInfoResult(lines);
+        } catch (e) {
+            showToast('error', '写 worldInfo 异常：' + (e && e.message));
+        }
+    }
+
+    function writeWorldInfoResult(lines) {
+        lines.push('（以上结果已存入自检，点「运行自检」也能看到）');
+        diag.wiTestResult = lines.join('\n');
+        showToast('info', '写 worldInfo 落盘测试完成，结果已显示');
+        log(lines.join('\n'));
+        try {
+            const panel = getSettingsPanel();
+            if (panel) {
+                const pre = panel.querySelector('#sihs-diag-pre');
+                if (pre) {
+                    pre.textContent = lines.join('\n');
+                    pre.style.display = 'block';
+                }
+            }
+        } catch (e) { /* ignore */ }
     }
 
     // --- 自检诊断（设置面板按钮，不需要 F12 控制台） ---
@@ -1190,6 +1291,10 @@
 
             lines.push('[面板状态]');
             lines.push('启用开关: ' + (extensionEnabled ? '开' : '关'));
+            if (diag.wiTestResult) {
+                lines.push('');
+                lines.push(diag.wiTestResult);
+            }
         } catch (e) {
             lines.push('自检异常: ' + (e && e.message));
         }
