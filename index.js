@@ -1,4 +1,4 @@
-// SillyTavern 扩展：已购衣物同步 (stand-in-honeymoon-sync)
+// SillyTavern 扩展：暮蝶做的蜜月换衣间（已购衣物同步） (stand-in-honeymoon-sync)
 // 需求：对话中购买「可购买衣物库」的衣物后，自动追加到独立的「已购衣物库」世界书条目。
 // 定稿方案（见同目录 实现须知.md）：
 //   - 已购衣物做成独立世界书条目（comment="已购衣物库"），与「已有衣物库」同等地位，不塞进 id12
@@ -21,12 +21,12 @@
     const getContext = _st.getContext || window.getContext;
     const saveCharacterDebounced = _st.saveCharacterDebounced || window.saveCharacterDebounced;
 
-    const PREFIX = '[已购衣物同步]';
+    const PREFIX = '[暮蝶换衣间]';
     const STORAGE_KEY_ENABLED = 'standInHoneyMoonSync_enabled_v1';
     // 已购库本地备份：云平台若保存不落盘，扩展每次加载从这恢复，保证模型能读到已购库
     const STORAGE_KEY_BACKUP = 'standInHoneyMoonSync_backup_v1';
     const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
-    const SETTINGS_VERSION = '1.1.5';
+    const SETTINGS_VERSION = '1.2.0';
 
     // 诊断记录（设置面板自检显示，不需要 F12 控制台）
     const diag = {
@@ -159,7 +159,7 @@
     function showToast(type, msg) {
         try {
             if (window.toastr && typeof window.toastr[type] === 'function') {
-                window.toastr[type](msg, '已购衣物同步');
+                window.toastr[type](msg, '暮蝶做的蜜月换衣间');
                 return;
             }
         } catch (e) { /* ignore */ }
@@ -623,8 +623,7 @@
                 try {
                     localStorage.setItem(STORAGE_KEY_ENABLED, String(extensionEnabled));
                 } catch (e) { /* ignore */ }
-                showToast(extensionEnabled ? '已购衣物同步已启用' : '已购衣物同步已禁用');
-                updateSettingsStatus();
+                showToast(extensionEnabled ? '已购衣物同步已启用' : '已购衣物同步已禁用');                updateSettingsStatus();
             });
         }
 
@@ -701,7 +700,7 @@
         try {
             const context = getContext();
             const c = context ? context : null;
-            lines.push('=== 已购衣物同步 自检 ===');
+            lines.push('=== 暮蝶做的蜜月换衣间 自检 ===');
             lines.push('[环境]');
             lines.push('getContext: ' + (c ? '可用' : '缺失'));
             if (c) {
