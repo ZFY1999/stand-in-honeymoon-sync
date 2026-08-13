@@ -1,7 +1,7 @@
 {
   "name": "stand-in-honeymoon-sync",
   "display_name": "暮蝶做的蜜月换衣间",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "description": "对话中购买「可购买衣物库」的衣物后，自动追加到「已购衣物库」世界书条目（与「已有衣物库」同等地位）。",
   "author": "暮蝶",
   "js": "index.js",
