@@ -26,7 +26,7 @@
     // 已购库本地备份：云平台若保存不落盘，扩展每次加载从这恢复，保证模型能读到已购库
     const STORAGE_KEY_BACKUP = 'standInHoneyMoonSync_backup_v1';
     const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
-    const SETTINGS_VERSION = '1.2.3';
+    const SETTINGS_VERSION = '1.2.4';
 
     // 诊断记录（设置面板自检显示，不需要 F12 控制台）
     const diag = {
@@ -45,6 +45,7 @@
         pollChecks: 0,       // 轮询检查次数
         pollHits: 0,         // 轮询发现聊天增长（抓到新消息）的次数
         pollAdded: '',       // 轮询累计追加的款式
+        wiSynced: false,     // 是否成功同步进活跃世界书(context.worldInfo)
     };
 
     // 轮询状态：事件系统不可靠（云平台可能不发 MESSAGE_RECEIVED），靠 chat.length 变化兜底。
@@ -361,6 +362,34 @@
         return entry;
     }
 
+    // 同步「已购衣物库」到平台活跃世界书（context.worldInfo）。
+    // 标准 SillyTavern 聊天激活的世界书条目数组，平台编辑器显示/保存的就是这份；
+    // 扩展改 data.character_book 不落盘时，这份是真正落盘的路径。返回 true 表示已写入。
+    function syncToActiveWorld(context, content) {
+        if (!context || !Array.isArray(context.worldInfo)) return false;
+        const hasShelf = context.worldInfo.some((e) => e && e.comment && String(e.comment).includes('可购买衣物库'));
+        if (!hasShelf) return false; // worldInfo 不是代替蜜月角色世界书，不动
+        let entry = context.worldInfo.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
+        if (!entry) {
+            // 仿照「已有衣物库」/「可购买衣物库」条目字段新建，然后 push 进 worldInfo
+            const fakeChar = { character_book: { entries: context.worldInfo } };
+            const built = buildNewPurchasedEntry(fakeChar, content);
+            if (!built) return false;
+            // world info 条目常见带 uid（编辑器/保存依赖），给个不冲突的值
+            let maxUid = -1;
+            for (const e of context.worldInfo) {
+                if (e && typeof e.uid === 'number' && e.uid > maxUid) maxUid = e.uid;
+            }
+            if (built.uid === undefined) built.uid = maxUid + 1;
+            entry = built;
+        }
+        entry.content = content;
+        if (typeof context.saveWorldInfo === 'function') {
+            try { context.saveWorldInfo(); } catch (e) { log('saveWorldInfo 失败：', e); }
+        }
+        return true;
+    }
+
     // --- 轮询兜底：云平台事件系统可能不触发 MESSAGE_RECEIVED，靠 chat.length 变化捕获新消息 ---
     // 只分析"新增"的消息，不重扫历史。事件照常监听（双保险），轮询是兜底。
     function watchChat() {
@@ -462,6 +491,9 @@
         diag.charPath = path;
         if (fromPoll) diag.pollAdded = added.join('、');
         writeBackup(charNameKey(char), content); // 无论平台是否落盘，本地备份先存
+        // 关键：同步到活跃世界书（context.worldInfo）——平台编辑器真正读写的存储
+        diag.wiSynced = syncToActiveWorld(context, content);
+        if (diag.wiSynced) log('已同步进活跃世界书（context.worldInfo）');
 
         // 保存：把所有候选保存接口全开火（谁真正落盘谁负责），不因单个成功短路。
         if (!saveCharacterSafe(context, index, char)) {
@@ -537,6 +569,14 @@
             const existing = entries.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
             const b = backupFor(charNameKey(char));
             const countItems = (s) => { const m = s ? s.match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) : null; return m ? m.length : 0; };
+            const restoreContent = (c) => {
+                // 恢复动作：写内存 + 同步进活跃世界书 + 保存
+                if (Array.isArray(context.worldInfo) &&
+                    context.worldInfo.some((e) => e && e.comment && String(e.comment).includes('可购买衣物库'))) {
+                    diag.wiSynced = syncToActiveWorld(context, c) || diag.wiSynced;
+                }
+                saveCharacterSafe(context, target.index, char);
+            };
             if (existing) {
                 if (countItems(existing.content) > 0) {
                     refreshBackup(charNameKey(char), existing.content);
@@ -548,7 +588,7 @@
                     existing.content = b.content;
                     diag.loadReapply = `平台版本为空条目，从备份覆盖恢复（${countItems(b.content)} 款）`;
                     log('平台版本为空条目，从备份覆盖恢复已购衣物库');
-                    saveCharacterSafe(context, target.index, char);
+                    restoreContent(existing.content);
                     return true;
                 }
                 refreshBackup(charNameKey(char), existing.content);
@@ -560,7 +600,7 @@
                 if (entry) {
                     diag.loadReapply = `从本地备份恢复已购衣物库（${countItems(entry.content)} 款）`;
                     log('从本地备份恢复「已购衣物库」条目');
-                    saveCharacterSafe(context, target.index, char);
+                    restoreContent(entry.content);
                     return true;
                 }
                 diag.loadReapply = '备份存在但重建条目失败';
@@ -796,6 +836,15 @@
             lines.push('检查次数: ' + diag.pollChecks);
             lines.push('发现新增批次: ' + diag.pollHits);
             lines.push('轮询追加款式: ' + (diag.pollAdded || '(尚无)'));
+
+            lines.push('[活跃世界书 worldInfo]');
+            lines.push('worldInfo 类型: ' + (c && c.worldInfo ? (Array.isArray(c.worldInfo) ? '数组' : typeof c.worldInfo) : 'undefined'));
+            if (c && Array.isArray(c.worldInfo)) {
+                lines.push('worldInfo 长度: ' + c.worldInfo.length);
+                lines.push('worldInfo 含可购买库: ' + (c.worldInfo.some((e) => e && String(e.comment || '').includes('可购买衣物库')) ? '是' : '否'));
+                lines.push('worldInfo 含已购库: ' + (c.worldInfo.some((e) => e && String(e.comment || '').includes('已购衣物库')) ? '是' : '否'));
+            }
+            lines.push('扩展已写入 worldInfo: ' + (diag.wiSynced ? '是' : '否'));
 
             lines.push('[角色世界书]');
             const target = c ? getTargetCharacter(c) : null;
