@@ -499,6 +499,15 @@
         return !!(cb && Array.isArray(cb.entries) && cb.entries.some((e) => e && e.comment && String(e.comment).includes('可购买衣物库')));
     }
 
+    // 林婉清模式是否激活：auto 卡内带货架 → 激活；强制 replace-honeymoon → 激活；global → 不激活。
+    // 返回 { active, reason }。状态栏/诊断反馈用（「林婉清模式已对齐世界书」的判断依据）。
+    function linWanqingModeActive(role) {
+        if (shelfSourceMode === 'replace-honeymoon') return { active: true, reason: '强制专属书' };
+        if (shelfSourceMode === 'global') return { active: false, reason: '强制全局书' };
+        const hasShelf = charHasShelfLocally(role && role.char);
+        return { active: hasShelf, reason: hasShelf ? '卡内自带可购买衣物库' : '卡内无货架（读全局书）' };
+    }
+
     // 货架（可购买衣物库 content）从哪读。
     // auto：当前角色卡内包含「可购买衣物库」条目 → 读该角色的专属书；否则 → 全局书《暮蝶衣物库》。
     //       （不再按角色名猜：卡自带货架就以卡为准，其他卡统一读全局书。）
@@ -1155,17 +1164,19 @@
         updateSettingsStatus();
     }
 
-    function updateSettingsStatus() {
+    async function updateSettingsStatus() {
         const panel = getSettingsPanel();
         if (!panel) return;
         const $disp = panel.querySelector('#sihs-status-display');
         const $disp2 = panel.querySelector('#sihs-status-display-2');
+        const $disp3 = panel.querySelector('#sihs-status-display-3');
         try {
             const context = getContext();
             const role = context ? resolveCurrentChatRole(context) : null;
             if (!role || !role.char) {
                 if ($disp) $disp.textContent = '当前聊天角色：未识别（' + ((role && role.reason) || 'getContext 不可用') + '）';
                 if ($disp2) $disp2.textContent = '已购库写入目标：未绑定（识别失败宁可空转不猜着写）';
+                if ($disp3) $disp3.textContent = '';
                 return;
             }
             const charName = role.name || '(无名)';
@@ -1185,6 +1196,26 @@
                 }
             } catch (e) { /* ignore */ }
             if ($disp2) $disp2.textContent = warn;
+            // 第三行：货架实际对齐到哪本书/哪个卡（异步解析真实货架来源，显示"现在对齐的是哪个"）
+            if ($disp3) {
+                $disp3.textContent = '货架对齐中…';
+                try {
+                    const lm = linWanqingModeActive(role);
+                    const shelf = await getShelfSource(context, role);
+                    if (shelf.found) {
+                        const src = (shelf.name ? '「' + shelf.name + '」' : '「(无名)」') + (shelf.mode ? '(' + shelf.mode + ')' : '');
+                        $disp3.textContent = (lm.active
+                            ? '林婉清模式：已激活（' + lm.reason + '）· 货架对齐当前角色专属书 ' + src + ' ✓'
+                            : '林婉清模式：未激活（' + lm.reason + '）· 货架对齐全局书 ' + src + ' ✓');
+                    } else {
+                        $disp3.textContent = (lm.active
+                            ? '林婉清模式：已激活（' + lm.reason + '）· ⚠ 货架未找到：' + (shelf.err || '')
+                            : '林婉清模式：未激活（' + lm.reason + '）· ⚠ 货架未找到：' + (shelf.err || ''));
+                    }
+                } catch (e) {
+                    $disp3.textContent = '货架对齐：查询失败（不影响监听）。';
+                }
+            }
         } catch (e) {
             if ($disp) $disp.textContent = '状态获取失败（不影响监听）。';
         }
@@ -1982,6 +2013,14 @@
                 forceSync: forceSyncNow,
                 // 调试：切换货架读取源（测试用；设置面板改动走 localStorage + 事件）
                 setShelfSource: (m) => { shelfSourceMode = (m === 'replace-honeymoon' || m === 'global') ? m : 'auto'; return shelfSourceMode; },
+                // 调试：货架实际对齐到哪本书（状态栏第三行「货架对齐」的数据源）
+                getShelfInfo: async () => {
+                    const c = getContext();
+                    const role = c ? resolveCurrentChatRole(c) : null;
+                    if (!role || !role.char) return { found: false, err: '未识别当前聊天角色' };
+                    const s = await getShelfSource(c, role);
+                    return { found: s.found, name: s.name, mode: s.mode, err: s.err || '' };
+                },
                 testSave: testSaveNow,
                 // 测试任意购买消息：返回命中+索引行结果（不改任何数据）。货架按当前读取源（auto/专属/全局）解析。
                 testPurchase: async (text) => {
