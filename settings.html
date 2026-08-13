@@ -66,7 +66,20 @@
                 </button>
             </div>
             <div class="description_text" style="font-size: 12px; color: #777; margin-top: 4px">
-                买完衣物：点「同步已购库到服务器」写入平台世界书；若那一步失败，用「导出角色卡」下载最新卡后重新导入覆盖。
+                买完衣物：点「同步到服务器」写入平台世界书；若那一步失败，用「导出角色卡」下载最新卡后重新导入覆盖。
+            </div>
+
+            <div class="setting_item">
+                <span>服务器世界书名（可选）</span>
+                <input
+                    id="sihs-worldbook-name"
+                    type="text"
+                    style="width: 100%; margin-top: 4px"
+                    placeholder="如 代替蜜月_Worldbooks（留空自动找）"
+                />
+            </div>
+            <div class="description_text" style="font-size: 12px; color: #777">
+                扩展写入服务器世界书的名字。留空则自动按「角色名_Worldbooks」找，找不到再全量扫。改完即生效。
             </div>
 
             <div
@@ -104,6 +117,13 @@
                         style="flex: 1 1 30%; min-width: 108px; margin: 0"
                     >
                         <i class="fa-solid fa-floppy-disk"></i> 测试保存
+                    </button>
+                    <button
+                        id="sihs-copy-diag"
+                        class="menu_button"
+                        style="flex: 1 1 30%; min-width: 108px; margin: 0"
+                    >
+                        <i class="fa-solid fa-copy"></i> 复制诊断
                     </button>
                 </div>
             </details>
