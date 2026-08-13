@@ -26,7 +26,7 @@
     // 已购库本地备份：云平台若保存不落盘，扩展每次加载从这恢复，保证模型能读到已购库
     const STORAGE_KEY_BACKUP = 'standInHoneyMoonSync_backup_v1';
     const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
-    const SETTINGS_VERSION = '1.2.4';
+    const SETTINGS_VERSION = '1.3.0';
 
     // 诊断记录（设置面板自检显示，不需要 F12 控制台）
     const diag = {
@@ -46,6 +46,9 @@
         pollHits: 0,         // 轮询发现聊天增长（抓到新消息）的次数
         pollAdded: '',       // 轮询累计追加的款式
         wiSynced: false,     // 是否成功同步进活跃世界书(context.worldInfo)
+        targetIndex: -1,     // 目标角色在 characters 数组的下标
+        charIdChar: '',      // characterId 指向的角色名
+        editorSynced: false, // 是否同步进编辑器活动书(characterBook/settings.world_info)
     };
 
     // 轮询状态：事件系统不可靠（云平台可能不发 MESSAGE_RECEIVED），靠 chat.length 变化兜底。
@@ -390,6 +393,50 @@
         return true;
     }
 
+    // 同步到平台世界书"编辑器活动书"：context.characterBook（ST 编辑器当前打开的角色书）
+    // 与 settings.world_info / window.world_info（全局世界书列表，角色书可能被挂进来）。
+    // 标准 ST 编辑器打开角色书后改的是活动副本；若平台编辑器读的是这份而非 data.character_book，
+    // 这里补写，保证已打开的编辑器能立即看到。全部防御式，找不到就跳过。
+    function syncToEditorState(context, content) {
+        if (!context) return false;
+        let touched = 0;
+        const setEntry = (entriesArr) => {
+            if (!Array.isArray(entriesArr)) return false;
+            const hasShelf = entriesArr.some((e) => e && e.comment && String(e.comment).includes('可购买衣物库'));
+            if (!hasShelf) return false; // 不是代替蜜月的角色世界书，不动
+            let entry = entriesArr.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
+            if (!entry) {
+                const fakeChar = { character_book: { entries: entriesArr } };
+                const built = buildNewPurchasedEntry(fakeChar, content);
+                if (!built) return false;
+                let maxUid = -1;
+                for (const e of entriesArr) {
+                    if (e && typeof e.uid === 'number' && e.uid > maxUid) maxUid = e.uid;
+                }
+                if (built.uid === undefined) built.uid = maxUid + 1;
+                entry = built;
+                entriesArr.push(entry);
+            }
+            entry.content = content;
+            return true;
+        };
+        // 1) context.characterBook：编辑器当前打开的角色书
+        const cb = context.characterBook;
+        if (cb && Array.isArray(cb.entries) && setEntry(cb.entries)) touched++;
+        // 2) 全局世界书列表：context.settings.world_info → window.world_info 兜底
+        let wiList = (context.settings && Array.isArray(context.settings.world_info))
+            ? context.settings.world_info : null;
+        if (!wiList) {
+            try { if (Array.isArray(window.world_info)) wiList = window.world_info; } catch (e) { /* ignore */ }
+        }
+        if (Array.isArray(wiList)) {
+            for (const book of wiList) {
+                if (book && Array.isArray(book.entries) && setEntry(book.entries)) touched++;
+            }
+        }
+        return touched > 0;
+    }
+
     // --- 轮询兜底：云平台事件系统可能不触发 MESSAGE_RECEIVED，靠 chat.length 变化捕获新消息 ---
     // 只分析"新增"的消息，不重扫历史。事件照常监听（双保险），轮询是兜底。
     function watchChat() {
@@ -494,6 +541,8 @@
         // 关键：同步到活跃世界书（context.worldInfo）——平台编辑器真正读写的存储
         diag.wiSynced = syncToActiveWorld(context, content);
         if (diag.wiSynced) log('已同步进活跃世界书（context.worldInfo）');
+        diag.editorSynced = syncToEditorState(context, content);
+        if (diag.editorSynced) log('已同步进编辑器活动书（characterBook/settings.world_info）');
 
         // 保存：把所有候选保存接口全开火（谁真正落盘谁负责），不因单个成功短路。
         if (!saveCharacterSafe(context, index, char)) {
@@ -570,11 +619,12 @@
             const b = backupFor(charNameKey(char));
             const countItems = (s) => { const m = s ? s.match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) : null; return m ? m.length : 0; };
             const restoreContent = (c) => {
-                // 恢复动作：写内存 + 同步进活跃世界书 + 保存
+                // 恢复动作：写内存 + 同步进活跃世界书/编辑器活动书 + 保存
                 if (Array.isArray(context.worldInfo) &&
                     context.worldInfo.some((e) => e && e.comment && String(e.comment).includes('可购买衣物库'))) {
                     diag.wiSynced = syncToActiveWorld(context, c) || diag.wiSynced;
                 }
+                diag.editorSynced = syncToEditorState(context, c) || diag.editorSynced;
                 saveCharacterSafe(context, target.index, char);
             };
             if (existing) {
@@ -845,6 +895,45 @@
                 lines.push('worldInfo 含已购库: ' + (c.worldInfo.some((e) => e && String(e.comment || '').includes('已购衣物库')) ? '是' : '否'));
             }
             lines.push('扩展已写入 worldInfo: ' + (diag.wiSynced ? '是' : '否'));
+            lines.push('扩展已写入编辑器活动书: ' + (diag.editorSynced ? '是' : '否'));
+
+            lines.push('[平台存储探测]');
+            const charBook = c && c.characterBook;
+            lines.push('context.characterBook: ' + (charBook ? ((charBook.comment || charBook.name) || '(无名)') + '，entries ' + (Array.isArray(charBook.entries) ? charBook.entries.length : '非数组') : '不存在'));
+            if (charBook && Array.isArray(charBook.entries)) {
+                lines.push('  characterBook 含已购库: ' + (charBook.entries.some((e) => e && String(e.comment || '').includes('已购衣物库')) ? '是' : '否'));
+                lines.push('  characterBook 含可购买库: ' + (charBook.entries.some((e) => e && String(e.comment || '').includes('可购买衣物库')) ? '是' : '否'));
+            }
+            let wiList = (c && c.settings && Array.isArray(c.settings.world_info)) ? c.settings.world_info : null;
+            let wiSrc = 'context.settings.world_info';
+            if (!wiList) {
+                try { if (Array.isArray(window.world_info)) { wiList = window.world_info; wiSrc = 'window.world_info'; } } catch (e) { /* ignore */ }
+            }
+            lines.push('世界书列表(' + wiSrc + '): ' + (Array.isArray(wiList) ? wiList.length + ' 本' : '不存在'));
+            if (Array.isArray(wiList)) {
+                for (const book of wiList.slice(0, 12)) {
+                    const hasShelf = Array.isArray(book.entries) && book.entries.some((e) => e && String(e.comment || '').includes('可购买衣物库'));
+                    const hasPur = Array.isArray(book.entries) && book.entries.some((e) => e && String(e.comment || '').includes('已购衣物库'));
+                    lines.push('  - ' + (book.name || '(无名)') + '：' + (Array.isArray(book.entries) ? book.entries.length : '?') + ' 条' + (hasShelf ? ' [含可购买库]' : '') + (hasPur ? ' [含已购库]' : ''));
+                }
+            }
+            try {
+                if (c && typeof c.getWorldInfo === 'function') {
+                    const wl = c.getWorldInfo();
+                    lines.push('getWorldInfo(): ' + (Array.isArray(wl) ? wl.length + ' 本' : '不可用'));
+                }
+            } catch (e) { lines.push('getWorldInfo(): 调用异常'); }
+            const localHits = [];
+            try {
+                for (let li = 0; li < localStorage.length; li++) {
+                    const lk = localStorage.key(li);
+                    try {
+                        const lv = localStorage.getItem(lk) || '';
+                        if (lv.length > 50 && lv.includes('已购衣物库')) localHits.push(lk + '(' + lv.length + ')');
+                    } catch (e) { /* ignore */ }
+                }
+            } catch (e) { /* ignore */ }
+            lines.push('localStorage 含已购衣物库的键: ' + (localHits.length ? localHits.join(', ') : '(无)'));
 
             lines.push('[角色世界书]');
             const target = c ? getTargetCharacter(c) : null;
@@ -855,6 +944,13 @@
                 diag.charPath = path;
                 const entries = (cb && cb.entries) || [];
                 lines.push('目标角色: ' + (target.char.name || (target.char.data && target.char.data.name) || '?'));
+                lines.push('目标角色下标: ' + target.index + '（characterId=' + c.characterId + '，' + (target.index === c.characterId ? '一致' : '不一致 ← 关注') + '）');
+                const idChar = (typeof c.characterId === 'number' && Array.isArray(c.characters) && c.characters[c.characterId]) ? c.characters[c.characterId] : null;
+                lines.push('characterId 指向: ' + (idChar ? (idChar.name || (idChar.data && idChar.data.name) || '(无名)') : '(无)'));
+                if (idChar) {
+                    const idcb = resolveCharBook(idChar).cb;
+                    lines.push('characterId 角色含可购买库: ' + ((idcb && idcb.entries && idcb.entries.some((e) => e && String(e.comment || '').includes('可购买衣物库'))) ? '是' : '否'));
+                }
                 lines.push('来源路径: ' + (path || '未找到'));
                 lines.push('entries 总数: ' + entries.length);
                 const shelf = entries.find((e) => e && e.comment && String(e.comment).includes('可购买衣物库'));
