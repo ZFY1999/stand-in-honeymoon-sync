@@ -1102,6 +1102,22 @@
             $writeServer.addEventListener('click', () => { writeServerWorldInfoNow(); });
         }
 
+        // 清空已购（从零开始）：清本地备份键 + 服务器已购库重置空白模板（新卡不继承旧记录）
+        const $reset = panel.querySelector('#sihs-reset-purchased');
+        if ($reset) {
+            $reset.addEventListener('click', async () => {
+                if (!confirm('确定清空当前角色的已购衣物记录？本地备份 + 服务器世界书都会重置为空白模板，无法撤销。')) return;
+                const r = await resetPurchasedNow();
+                const lines = r.lines || ['（无输出）'];
+                diag.serverWriteResult = lines.join('\n');
+                log(lines.join('\n'));
+                const pre = panel.querySelector('#sihs-diag-pre');
+                if (pre) { pre.textContent = lines.join('\n'); pre.style.display = 'block'; }
+                showToast(r.ok ? 'info' : 'warning', r.ok ? '已清空，从零开始' : '清空完成但结果有异常，见诊断');
+                updateSettingsStatus();
+            });
+        }
+
         // 可购买库读取源：auto / replace-honeymoon / global（localStorage 持久化）
         const $src = panel.querySelector('#sihs-shelf-source');
         if ($src) {
@@ -1641,6 +1657,75 @@
         writeServerResult(lines);
     }
 
+    // 一键清空已购库（从零开始）：清本地该角色备份键 + 服务器已购库条目重置为空白模板（无索引行）。
+    // 用于「新卡不该继承旧卡已购记录」的场景——旧 10 款来自本地备份命中（同名同指纹），清掉后新卡从 0 记。
+    // 返回 { ok, lines }；不弹 toast，结果进 diag。
+    async function resetPurchasedNow() {
+        const lines = ['【清空已购记录（从零开始）】'];
+        const c = getContext();
+        const role = c ? resolveCurrentChatRole(c) : null;
+        if (!role || !role.char) { lines.push('未识别当前聊天角色'); return { ok: false, lines }; }
+        const name = role.name || charNameKey(role.char);
+        // ① 清本地备份键（角色名::指纹 + 旧纯名键）
+        try {
+            const map = loadBackup();
+            const key = roleBackupKey(role.char, name);
+            let cleared = 0;
+            if (map[key]) { delete map[key]; cleared++; }
+            if (map[name]) { delete map[name]; cleared++; }
+            saveBackup(map);
+            lines.push('本地备份已清: ' + (cleared ? ('删除键 ' + key + (name !== key ? (' + ' + name) : '')) : '（无该角色备份，本就干净）'));
+        } catch (e) { lines.push('本地备份清理异常: ' + String((e && e.message) || e)); }
+        // ② 清当前角色卡本地已购库条目（内存 + 世界书），重置为空白模板
+        try {
+            const wb = getWardrobeBook(role);
+            if (wb.entry && wb.cb) {
+                const e = wb.entry;
+                const had = (e.content || '').match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) || [];
+                e.content = PURCHASED_TEMPLATE;
+                // 同步进活跃世界书/编辑器活动书（守卫：只有已含已购库的书才更新）
+                if (Array.isArray(c.worldInfo) && c.worldInfo.some((x) => x && x.comment && String(x.comment).includes('已购衣物库'))) {
+                    try { syncToActiveWorld(c, PURCHASED_TEMPLATE); } catch (e2) { /* ignore */ }
+                }
+                try { syncToEditorState(c, PURCHASED_TEMPLATE); } catch (e2) { /* ignore */ }
+                saveCharacterSafe(c, role.index, role.char);
+                lines.push('角色卡本地已购库已重置为空白模板（清掉 ' + (had.length || 0) + ' 款索引）');
+            } else {
+                lines.push('角色卡本地无已购库条目（无需重置）');
+            }
+        } catch (e) { lines.push('角色卡本地重置异常: ' + String((e && e.message) || e)); }
+        // ③ 服务器：读当前角色书 → 已购库条目重置为空白模板 → edit 写回 → 回读
+        try {
+            const wbName = await resolveWardrobeBookName(name);
+            const bookName = wbName.book;
+            if (!bookName) { lines.push('服务器: ' + (wbName.blocked || '未定位当前角色世界书，跳过（本地已清）')); return { ok: true, lines }; }
+            const rg = await serverGetBook(bookName);
+            if (!rg.ok) { lines.push('服务器读书失败: ' + rg.err); return { ok: false, lines }; }
+            const book = rg.book;
+            const entries = entriesToMap(book.entries);
+            const pur = findEntryByComment(book, '已购衣物库');
+            if (!pur) { lines.push('服务器书里没有「已购衣物库」条目，无需清'); return { ok: true, lines }; }
+            const had = (pur.content || '').match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) || [];
+            pur.content = PURCHASED_TEMPLATE;
+            book.entries = entries;
+            const save = await serverApi('POST', 'edit', { name: bookName, data: book });
+            lines.push('服务器 edit 落盘: HTTP ' + save.status + '（清掉 ' + (had.length || 0) + ' 款索引）');
+            await notifyWorldInfoRefreshed(bookName, book, false);
+            const v = await serverGetBook(bookName);
+            if (v.ok) {
+                const vp = findEntryByComment(v.book, '已购衣物库');
+                const n = vp ? extractIndexIds(vp.content || '').length : -1;
+                lines.push('服务器回读已购库编号数: ' + (n >= 0 ? n : '(条目缺失)'));
+                return { ok: n === 0, lines };
+            }
+            lines.push('服务器回读失败: ' + v.err);
+            return { ok: false, lines };
+        } catch (e) {
+            lines.push('服务器清理异常: ' + String((e && e.message) || e));
+            return { ok: false, lines };
+        }
+    }
+
     function writeServerResult(lines) {
         diag.serverWriteResult = lines.join('\n');
         log(lines.join('\n'));
@@ -2045,6 +2130,8 @@
                 setShelfSource: (m) => { shelfSourceMode = (m === 'replace-honeymoon' || m === 'global') ? m : 'auto'; return shelfSourceMode; },
                 // 调试：宽容编号提取（回读验证用它，测试 + 老大诊断都能用）
                 extractIndexIds,
+                // 调试：一键清空已购记录（从零开始）——清本地备份键 + 服务器已购库重置空白模板
+                resetPurchased: resetPurchasedNow,
                 // 调试：货架实际对齐到哪本书（状态栏第三行「货架对齐」的数据源）
                 getShelfInfo: async () => {
                     const c = getContext();
