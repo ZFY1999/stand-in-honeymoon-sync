@@ -24,7 +24,20 @@
     const PREFIX = '[已购衣物同步]';
     const STORAGE_KEY_ENABLED = 'standInHoneyMoonSync_enabled_v1';
     const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
-    const SETTINGS_VERSION = '1.1.0';
+    const SETTINGS_VERSION = '1.1.1';
+
+    // 角色世界书解析：兼容不同平台/卡结构。
+    // 标准 SillyTavern 处理后角色对象把 world 摊在顶层 character_book；
+    // 部分 fork / v3 卡原样保留 data 包裹（data.character_book），甚至 extensions 包裹。
+    // 返回 { cb, path }，path 供状态栏诊断显示命中的字段路径。
+    function resolveCharBook(character) {
+        if (!character) return { cb: null, path: '' };
+        const pick = (o) => (o && o.character_book && Array.isArray(o.character_book.entries) ? o.character_book : null);
+        if (pick(character)) return { cb: character.character_book, path: '顶层 character_book' };
+        if (character.data && pick(character.data)) return { cb: character.data.character_book, path: 'data.character_book' };
+        if (character.extensions && pick(character.extensions)) return { cb: character.extensions.character_book, path: 'extensions.character_book' };
+        return { cb: null, path: '' };
+    }
 
     // 可购买库分类汉字 → 分区标题（已购衣物库内的分区名）
     const CATEGORY_NAMES = {
@@ -216,11 +229,10 @@
     // 找到带「可购买衣物库」条目的角色（优先当前选中角色）。
     function getTargetCharacter(context) {
         const chars = (context && context.characters) || [];
-        const hasShelf = (c) =>
-            c &&
-            c.character_book &&
-            Array.isArray(c.character_book.entries) &&
-            c.character_book.entries.some((e) => e.comment && e.comment.includes('可购买衣物库'));
+        const hasShelf = (c) => {
+            const { cb } = resolveCharBook(c);
+            return !!cb && cb.entries.some((e) => e && e.comment && String(e.comment).includes('可购买衣物库'));
+        };
         const idx = typeof context.characterId === 'number' ? context.characterId : -1;
         if (idx >= 0 && hasShelf(chars[idx])) return { char: chars[idx], index: idx };
         for (let i = 0; i < chars.length; i++) {
@@ -231,8 +243,10 @@
 
     // 照「已有衣物库」条目拷贝字段，新建「已购衣物库」条目。
     function buildNewPurchasedEntry(char, template) {
-        const model = char.character_book.entries.find(
-            (e) => e.comment && e.comment.includes('已有衣物库'),
+        const { cb } = resolveCharBook(char);
+        if (!cb) return null;
+        const model = cb.entries.find(
+            (e) => e && e.comment && String(e.comment).includes('已有衣物库'),
         );
         const entry = {
             comment: '已购衣物库',
@@ -274,7 +288,7 @@
         if (entry.extensions && typeof entry.extensions === 'object') {
             entry.extensions.display_index = 13;
         }
-        char.character_book.entries.push(entry);
+        cb.entries.push(entry);
         return entry;
     }
 
@@ -285,7 +299,9 @@
         const target = getTargetCharacter(context);
         if (!target) return;
         const { char, index } = target;
-        const entries = char.character_book.entries;
+        const { cb, path } = resolveCharBook(char);
+        if (!cb) return;
+        const entries = cb.entries;
 
         const shelf = entries.find((e) => e.comment && e.comment.includes('可购买衣物库'));
         if (!shelf) return; // 没有货架条目，静默返回
@@ -324,19 +340,30 @@
         if (!changed) return;
         purchasedEntry.content = content;
 
-        // 保存：target 是当前选中角色 → 用 context.saveCharacterDebounced()（最稳）；
-        // 否则用带参版本存指定角色（新版酒馆支持）。
-        try {
-            const contextAgain = getContext();
-            if (contextAgain && contextAgain.characterId === index) {
-                contextAgain.saveCharacterDebounced();
-            } else {
-                saveCharacterDebounced(index, char);
-            }
+        // 保存：多路探测保存接口，任一路成功即可（云酒馆/fork 的 getContext 挂载不一致）。
+        // 优先标准 context.saveCharacterDebounced，其次全局 saveCharacterDebounced(index,char)。
+        if (!saveCharacterSafe(context, index, char)) {
+            log('保存角色失败：找不到可用的保存接口（请手动保存角色）');
+            showToast('warning', '已写入内存但自动保存失败，请手动保存角色');
+        } else {
             log(`已购衣物已同步：${added.join('、')}`);
-        } catch (e) {
-            log('保存角色失败：', e);
         }
+    }
+
+    // 多路保存：新版 context.saveCharacterDebounced / 旧版全局 saveCharacterDebounced(index,char)。
+    function saveCharacterSafe(context, index, char) {
+        const candidates = [];
+        if (context && typeof context.saveCharacterDebounced === 'function') {
+            candidates.push(() => context.saveCharacterDebounced());
+        }
+        const g1 = (window.SillyTavern && typeof window.SillyTavern.saveCharacterDebounced === 'function') ? window.SillyTavern.saveCharacterDebounced : null;
+        const g2 = (typeof window.saveCharacterDebounced === 'function') ? window.saveCharacterDebounced : null;
+        const fallback = g1 || g2;
+        if (fallback) candidates.push(() => fallback(index, char));
+        for (const fn of candidates) {
+            try { fn(); return true; } catch (e) { /* 试下一路 */ }
+        }
+        return false; // 有候选但全抛错 → 由上层提示手动保存
     }
 
     function onMessage(...args) {
@@ -459,10 +486,11 @@
             if (!target) {
                 text = '未找到带「可购买衣物库」的角色（当前角色需是"代替蜜月"）。';
             } else {
-                const entries = target.char.character_book.entries;
-                const hasShelf = entries.some((e) => e.comment && e.comment.includes('可购买衣物库'));
-                const hasPurchased = entries.some((e) => e.comment && e.comment.includes('已购衣物库'));
-                text = `目标角色：${target.char.name}；可购买库：${hasShelf ? '有' : '无'}；已购衣物库：${hasPurchased ? '已创建' : '尚未创建（首次购买时自动创建）'}。`;
+                const { cb, path } = resolveCharBook(target.char);
+                const entries = (cb && cb.entries) || [];
+                const hasShelf = entries.some((e) => e && e.comment && String(e.comment).includes('可购买衣物库'));
+                const hasPurchased = entries.some((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
+                text = `目标角色：${target.char.name}；可购买库：${hasShelf ? '有' : '无'}；已购衣物库：${hasPurchased ? '已创建' : '尚未创建（首次购买时自动创建）'}；世界书来源：${path || '未找到'}。`;
             }
         } catch (e) {
             text = '状态获取失败（不影响监听）。';
