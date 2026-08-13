@@ -29,7 +29,7 @@
     // v1 备份（含编号的旧 content + 预置款式）一次性清除，避免 9 款默认衣服回灌。
     const STORAGE_KEY_BACKUP_V1 = 'standInHoneyMoonSync_backup_v1';
     const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
-    const SETTINGS_VERSION = '1.6.4';
+    const SETTINGS_VERSION = '1.6.5';
 
     // 诊断记录（设置面板自检显示，不需要 F12 控制台）
     const diag = {
@@ -1230,6 +1230,36 @@
         return null;
     }
 
+    // 通知前端世界书缓存与编辑台刷新（让界面即时显示，不用手动刷新页面）。
+    // Chloe 平台自己保存时会 worldInfoCache.set + emit WORLDINFO_UPDATED；
+    // 扩展直接 POST edit 绕过了这步，这里补上：缓存更新 + 事件 + 编辑器重渲染，全防御式。
+    function notifyWorldInfoRefreshed(bookName, book) {
+        const actions = [];
+        try {
+            const ctx = getContext();
+            // ① 走平台自己的 saveWorldInfo(name, data)：更新 worldInfoCache + emit WORLDINFO_UPDATED
+            //    若是真身，编辑器/缓存刷新；若是空壳，无害（服务器文件已由扩展写好）。
+            if (bookName && book && ctx && typeof ctx.saveWorldInfo === 'function') {
+                try { ctx.saveWorldInfo(bookName, book); actions.push('saveWorldInfo(' + bookName + ')'); } catch (e) { /* ignore */ }
+            }
+            // ② 编辑器重渲染（编辑台若正开着这本书会立即显示新条目）
+            if (ctx && typeof ctx.reloadWorldInfoEditor === 'function') {
+                try { ctx.reloadWorldInfoEditor(); actions.push('reloadWorldInfoEditor'); } catch (e) { /* ignore */ }
+            }
+            // ③ 世界书列表刷新（新增/改名可见）
+            if (ctx && typeof ctx.updateWorldInfoList === 'function') {
+                try { ctx.updateWorldInfoList(); actions.push('updateWorldInfoList'); } catch (e) { /* ignore */ }
+            }
+            // ④ 兜底 emit 平台事件（若无监听也无害）
+            const es = (window.SillyTavern && window.SillyTavern.eventSource) || window.eventSource;
+            const et = (window.SillyTavern && window.SillyTavern.event_types) || window.event_types;
+            if (es && et && et.WORLDINFO_UPDATED && typeof es.emit === 'function') {
+                try { es.emit(et.WORLDINFO_UPDATED, bookName, book); actions.push('emit WORLDINFO_UPDATED'); } catch (e) { /* ignore */ }
+            }
+        } catch (e) { /* ignore */ }
+        return actions;
+    }
+
     // 把「已购衣物库」content 写入服务器世界书（POST get → 改 entries → POST edit）。
     // 与世界书编辑台同一套 API，直接连服务器书——老大说的"选世界书连上去"就这么实现。
     // 返回 { ok, lines }；不弹 toast，结果进 diag，失败静默（本地备份兜底）。
@@ -1276,6 +1306,10 @@
             book.entries = entries;
             const save = await serverApi('POST', 'edit', { name: bookName, data: book });
             lines.push('edit 落盘: HTTP ' + save.status);
+            // 刷新前端世界书缓存/编辑台（即时显示，不用手动刷新页面）
+            const refresh = notifyWorldInfoRefreshed(bookName, book);
+            if (refresh.length) lines.push('已通知前端刷新: ' + refresh.join(' + '));
+            else lines.push('（未找到前端刷新接口，编辑台如未更新需刷新页面）');
             // 回读验证：已购库 content 不含编号（编号在记账层），用内容比对判断落盘
             const v = await serverGetBook(bookName);
             if (v.ok) {
