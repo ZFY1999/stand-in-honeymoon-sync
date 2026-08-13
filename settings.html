@@ -11,7 +11,7 @@
         </div>
         <div class="inline-drawer-content">
             <div class="description_text">
-                对话中购买「可购买衣物库」的衣物后，自动追加到「已购衣物库」，并同步到服务器世界书。
+                对话中购买「可购买衣物库」的衣物后，自动在「已购衣物库」登记一行索引（款式名+编号），并同步到服务器世界书。货架可切换专属书/全局书，已购库永远写入当前角色自己的世界书。
             </div>
 
             <div class="setting_item">
@@ -28,10 +28,30 @@
                 关闭后不再监听购买场景（已添加的条目不会删除）。
             </div>
 
+            <div class="setting_item">
+                <span>可购买库读取源</span>
+                <select
+                    id="sihs-shelf-source"
+                    style="width: 100%; margin-top: 4px"
+                >
+                    <option value="auto">自动（卡内含货架→专属书，否则→全局书）</option>
+                    <option value="replace-honeymoon">代替蜜月专属书</option>
+                    <option value="global">全局书《暮蝶衣物库》</option>
+                </select>
+            </div>
+            <div class="description_text" style="font-size: 12px; color: #777">
+                货架（可购买衣物库）从哪读。自动模式下：当前角色卡内自带「可购买衣物库」条目就读该角色的专属世界书，卡里没有就读全局《暮蝶衣物库》。全局书只读不写，检测不到请在平台上导入，扩展绝不自动创建。已购库永远写入当前角色自己的世界书。
+            </div>
+
             <div
                 id="sihs-status-display"
                 class="description_text"
                 style="margin-top: 8px"
+            ></div>
+            <div
+                id="sihs-status-display-2"
+                class="description_text"
+                style="margin-top: 4px; font-size: 12px; color: #c8a24a"
             ></div>
 
             <div

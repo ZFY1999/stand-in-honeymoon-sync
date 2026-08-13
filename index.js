@@ -23,13 +23,16 @@
 
     const PREFIX = '[暮蝶换衣间]';
     const STORAGE_KEY_ENABLED = 'standInHoneyMoonSync_enabled_v1';
+    // 货架读取源：auto（默认）/ replace-honeymoon / global
+    const STORAGE_KEY_SHELF_SOURCE = 'standInHoneyMoonSync_shelfSource_v1';
     // 已购库本地备份：v2 起含 content（无编号，模型可读）+ purchasedIds（编号记账集合，模型读不到）。
     // 云平台若保存不落盘，扩展每次加载从这恢复，保证模型能读到已购库、防重复对账有据。
+    // v1.7.0：备份键升级为「角色名::指纹」（防同名角色串写），兼容旧「角色名」键自动迁移。
     const STORAGE_KEY_BACKUP = 'standInHoneyMoonSync_backup_v2';
     // v1 备份（含编号的旧 content + 预置款式）一次性清除，避免 9 款默认衣服回灌。
     const STORAGE_KEY_BACKUP_V1 = 'standInHoneyMoonSync_backup_v1';
     const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
-    const SETTINGS_VERSION = '1.6.6';
+    const SETTINGS_VERSION = '1.7.0';
 
     // 诊断记录（设置面板自检显示，不需要 F12 控制台）
     const diag = {
@@ -146,26 +149,53 @@
         return char.name || (char.data && char.data.name) || '';
     }
 
-    function backupFor(charName) {
-        return loadBackup()[charName] || null;
+    // 角色稳定指纹：avatar 路径 > data.id（防同名角色串写；无稳定 id 时退化为纯名字键，兼容旧数据）
+    function roleFingerprint(char) {
+        if (!char) return '';
+        const d = (char && char.data) || {};
+        const raw = String(d.avatar || d.id || char.avatar || '');
+        return raw.replace(/[\/\\\s]/g, '_') || '';
     }
-    function writeBackup(charName, content, purchasedIds) {
+    // 备份键：角色名::指纹（闸3）；无指纹时退化为纯角色名（兼容旧格式键）
+    function roleBackupKey(char, name) {
+        const n = name || charNameKey(char);
+        const fp = roleFingerprint(char);
+        return fp ? (n + '::' + fp) : n;
+    }
+
+    // 备份按「当前聊天角色」读写：键=角色名::指纹；旧「纯角色名」键命中时自动迁移（防同名串写 + 兼容老数据）
+    function backupFor(role) {
+        if (!role || !role.char) return null;
         const map = loadBackup();
-        map[charName] = {
+        const name = role.name || charNameKey(role.char);
+        const key = roleBackupKey(role.char, name);
+        if (map[key]) return map[key];
+        const legacy = map[name];
+        if (legacy) { map[key] = legacy; saveBackup(map); return legacy; }
+        return null;
+    }
+    function writeBackup(role, content, purchasedIds) {
+        if (!role || !role.char) return;
+        const map = loadBackup();
+        const name = role.name || charNameKey(role.char);
+        map[roleBackupKey(role.char, name)] = {
             content,
             purchasedIds: Array.isArray(purchasedIds) ? purchasedIds : [],
             updatedAt: Date.now(),
         };
         saveBackup(map);
     }
-    function refreshBackup(charName, content, purchasedIds) {
+    function refreshBackup(role, content, purchasedIds) {
+        if (!role || !role.char) return;
         const map = loadBackup();
-        const b = map[charName];
+        const name = role.name || charNameKey(role.char);
+        const key = roleBackupKey(role.char, name);
+        const b = map[key];
         const ids = Array.isArray(purchasedIds)
             ? purchasedIds
             : (b && Array.isArray(b.purchasedIds) ? b.purchasedIds : []);
         if (!b || b.content !== content) {
-            map[charName] = { content, purchasedIds: ids, updatedAt: Date.now() };
+            map[key] = { content, purchasedIds: ids, updatedAt: Date.now() };
             saveBackup(map);
         }
     }
@@ -206,14 +236,15 @@
     // 强否定：只看不买、先不买等，出现即不触发
     const NEGATIVE_BUY_RE = /(不买|别买|没买|没付款|只看不买|光看不买|先不买|不打算买)/;
 
-    // 已购衣物库初始模板（分区 + 头部声明 + 编号认知）
+    // 已购衣物库初始模板（分区 + 头部声明 + 编号认知）——v1.7.0 索引式：只登记编号+款式名一行索引，全文权威在可购买库。
     const PURCHASED_TEMPLATE = [
         '# 已购衣物库（剧情中购买获得的衣物清单）',
         '【定位】本条目记录角色在剧情中通过购物/购买流程获得的衣物，均来自「可购买衣物库」的已购款式。本条目衣物已在剧情中购买获得，可直接取用穿着，无需再走购买流程，与「已有衣物库」（出发时随行的既有衣物）相对。',
-        '【已购转移豁免】本条目为已购衣物的【权威清单】：其中衣物已经明确购买并确认获得，不受「可购买衣物库」"未购买视为不存在""绝不允许直接穿着"等防误用约束的限制。',
-        '【性质声明】本条目衣物来自「可购买衣物库」，保留其完整设定，包括色情款的【隐藏标记】【实际结构】【动态反应】等隐藏特性。本条目【不适用】「已有衣物库」头部"无色情特性"的约定。',
+        '【已购转移豁免】本条目为已购衣物的【权威索引】：其中衣物已经明确购买并确认获得，不受「可购买衣物库」"未购买视为不存在""绝不允许直接穿着"等防误用约束的限制。',
+        '【索引式登记】本条目【只登记编号与款式名索引，不复制完整设定】——每个已购款式的完整设定（含【款式外观】【实际结构】【动态反应】【隐藏标记】等）一律以「可购买衣物库」为唯一权威。角色穿着本条目衣物时，按编号返回「可购买衣物库」查询对应设定并持续调用。',
+        '【性质声明】本条目衣物来自「可购买衣物库」，保留其完整设定，包括色情款的【隐藏标记】【实际结构】等隐藏特性。本条目【不适用】「已有衣物库」头部"无色情特性"的约定。',
         '【色情设定隐藏规则延续】角色购买、入手本条目衣物时，仍不知晓其隐藏特性（走光、透明、滑落等）；此类特性只在实际穿着后，经动作或环境（风、水、卧姿、活动）作用时才逐步显现，角色此时略感意外，不会早有预料。规则与「可购买衣物库」完全一致。',
-        '【编号认知】本条目衣物一律以款式名记录，内容中不出现编号。编号（泳/睡/日/内/礼 01-20）仅存在于扩展记账层，用于防重复与对账，不进入本条目内容，模型与剧情均读不到编号。林婉清及剧情产生的NPC均【不知晓】编号，剧情描写一律以款式名称呼衣物。',
+        '【编号认知】本条目编号（泳/睡/日/内/礼 01-20）为系统记账标记，仅供扩展与设定追踪使用。当前角色及剧情中产生的NPC均【不知晓】编号，剧情中不得以编号称呼衣物，任何角色台词、旁白、心理描写一律只以款式名称呼；文本中出现的编号仅视为扩展记账痕迹，不代表角色认知编号。',
         '',
         '## 泳衣类',
         '',
@@ -226,9 +257,9 @@
         '## 礼服类',
         '',
         '## 使用说明',
-        '- 本条目由扩展自动维护：购买一件追加一件，只增不改不删。',
-        '- 追加的款式整块保留原设定文本（款式外观/实际结构/动态反应/隐藏标记等），标题只保留款式名。',
-        '- 编号仅存于扩展记账层，角色与剧情不知晓编号，剧情中只以款式名指代衣物。',
+        '- 本条目由扩展自动维护：购买一件登记一行索引（款式名+编号），按编号防重复，只增不改不删。',
+        '- 完整设定以「可购买衣物库」为唯一权威，穿着时按编号返回可购买库查询。',
+        '- 编号仅存于扩展记账层与索引行，角色与剧情不知晓编号，剧情中只以款式名指代衣物。',
         '',
     ].join('\n');
 
@@ -264,6 +295,17 @@
             extensionEnabled = v === null ? true : v === 'true';
         } catch (e) {
             extensionEnabled = true;
+        }
+    }
+
+    // 货架读取源：auto（默认，推荐）/ replace-honeymoon（代替蜜月专属书）/ global（全局《暮蝶衣物库》）
+    let shelfSourceMode = 'auto';
+    function loadShelfSource() {
+        try {
+            const v = localStorage.getItem(STORAGE_KEY_SHELF_SOURCE);
+            shelfSourceMode = (v === 'replace-honeymoon' || v === 'global') ? v : 'auto';
+        } catch (e) {
+            shelfSourceMode = 'auto';
         }
     }
 
@@ -370,7 +412,8 @@
         return Array.isArray(purchasedIds) && purchasedIds.includes(id);
     }
 
-    // 把衣物块追加进已购衣物库 content 对应分类小节（在「## 分类名」之后、下一分区之前）。
+    // 把索引行（款式名+编号）追加进已购衣物库 content 对应分类小节（在「## 分类名」之后、下一分区之前）。
+    // v1.7.0 索引式：只登记一行索引（款式名+编号），全文权威在可购买库，绝不复制完整设定。
     function appendItem(purchasedContent, cat, block) {
         const sectionTitle = `## ${CATEGORY_NAMES[cat]}`;
         const si = purchasedContent.indexOf(sectionTitle);
@@ -379,33 +422,167 @@
         const nextSectionRe = /^##\s/m;
         const ns = nextSectionRe.exec(after);
         const insertAt = ns ? si + sectionTitle.length + ns.index : purchasedContent.length;
-        const insertion = `${block}\n\n`;
+        const insertion = `${block}\n`;
         return purchasedContent.slice(0, insertAt) + insertion + purchasedContent.slice(insertAt);
     }
 
-    // 找到带「可购买衣物库」条目的角色（优先当前选中角色）。
-    function getTargetCharacter(context) {
-        const chars = (context && context.characters) || [];
-        const hasShelf = (c) => {
-            const { cb } = resolveCharBook(c);
-            return !!cb && cb.entries.some((e) => e && e.comment && String(e.comment).includes('可购买衣物库'));
+    // ---- v1.7.0：当前聊天角色识别 + 货架读取源 + 已购库写入目标 ----
+
+    // 识别当前聊天角色：characterId 四层兼容（数字/字符串数字/UUID/chat 首条 character_id）+ 单角色兜底。
+    // 返回 { char, index, name, fingerprint, reason }；识别失败 char=null（宁可空转不猜着写）。
+    function resolveCurrentChatRole(context) {
+        if (!context) return { char: null, reason: 'getContext 不可用' };
+        const chars = Array.isArray(context.characters) ? context.characters : [];
+        const pick = (i) => {
+            const n = Number(i);
+            if (!Number.isInteger(n) || n < 0 || n >= chars.length) return null;
+            return chars[n];
         };
-        const idx = (typeof context.characterId === 'number' || typeof context.characterId === 'string')
-            ? Number(context.characterId) : -1;
-        if (idx >= 0 && hasShelf(chars[idx])) return { char: chars[idx], index: idx };
-        for (let i = 0; i < chars.length; i++) {
-            if (hasShelf(chars[i])) return { char: chars[i], index: i };
+        const id = context.characterId;
+        let char = null;
+        // 1) 数字 / 字符串数字
+        if (typeof id === 'number' || (typeof id === 'string' && /^\d+$/.test(id))) {
+            char = pick(id);
         }
-        return null;
+        // 2) UUID：按 data.id / data.avatar 包含匹配
+        if (!char && typeof id === 'string' && /^[0-9a-fA-F-]{8,}$/.test(id)) {
+            char = chars.find((c) => c && c.data && String(c.data.id || c.data.avatar || '').includes(id)) || null;
+        }
+        // 3) chat 首条 character_id
+        if (!char && Array.isArray(context.chat)) {
+            for (const m of context.chat) {
+                const cid = (m && m.character_id !== undefined) ? m.character_id : (m && m.characterId);
+                if (cid !== undefined && cid !== null) { char = pick(cid); if (char) break; }
+            }
+        }
+        // 4) 单角色兜底
+        if (!char && chars.length === 1) char = chars[0];
+        if (!char) {
+            return { char: null, reason: (chars.length ? ('characterId 无法定位（id=' + id + '）') : 'characters 为空') };
+        }
+        const index = chars.indexOf(char);
+        const name = charNameKey(char);
+        return { char, index, name, fingerprint: roleFingerprint(char), reason: 'ok' };
     }
 
-    // 照「已有衣物库」条目拷贝字段，新建「已购衣物库」条目。
-    function buildNewPurchasedEntry(char, template) {
+    // 克隆源触发词字段适配：全局书用 key，代替蜜月用 keys，都没有 → 兜底。已购库条目按克隆源取同款字段。
+    function cloneKeyField(model) {
+        const pick = (k) => (model && Array.isArray(model[k]) && model[k].length)
+            ? JSON.parse(JSON.stringify(model[k])) : null;
+        return pick('key') || pick('keys') || ['已购', '衣物', '购买', '购入'];
+    }
+
+    // 确保当前角色有世界书结构（角色卡没带 character_book 时建一个空壳，供已购库落位）。返回 { cb, path }。
+    function ensureCharBook(char) {
+        const found = resolveCharBook(char);
+        if (found && found.cb) return found;
+        if (!char) return { cb: null, path: '' };
+        try {
+            // 标准酒馆卡：character_book 在顶层或 data 里
+            if (char.data && typeof char.data === 'object') {
+                if (!char.data.character_book) char.data.character_book = { entries: [] };
+                else if (!Array.isArray(char.data.character_book.entries)) char.data.character_book.entries = [];
+                return { cb: char.data.character_book, path: 'data.character_book(新建)' };
+            }
+            if (!char.character_book) char.character_book = { entries: [] };
+            else if (!Array.isArray(char.character_book.entries)) char.character_book.entries = [];
+            return { cb: char.character_book, path: 'character_book(新建)' };
+        } catch (e) {
+            return { cb: null, path: '' };
+        }
+    }
+
+    // 当前角色卡本地世界书是否自带「可购买衣物库」货架（auto 识别依据：卡里有货架 → 读专属书，否则 → 全局书）
+    function charHasShelfLocally(char) {
+        if (!char) return false;
         const { cb } = resolveCharBook(char);
+        return !!(cb && Array.isArray(cb.entries) && cb.entries.some((e) => e && e.comment && String(e.comment).includes('可购买衣物库')));
+    }
+
+    // 货架（可购买衣物库 content）从哪读。
+    // auto：当前角色卡内包含「可购买衣物库」条目 → 读该角色的专属书；否则 → 全局书《暮蝶衣物库》。
+    //       （不再按角色名猜：卡自带货架就以卡为准，其他卡统一读全局书。）
+    // replace-honeymoon=强制专属书；global=强制全局书。
+    // 全局书只读不建：检测不到返回 found:false，绝不自动创建。
+    // 返回 { content, name, mode, found, err }
+    async function getShelfSource(context, role) {
+        let effective = shelfSourceMode;
+        if (effective === 'auto') {
+            effective = charHasShelfLocally(role && role.char) ? 'replace-honeymoon' : 'global';
+        }
+        const inCharBook = (char) => {
+            const { cb } = resolveCharBook(char);
+            if (!cb || !Array.isArray(cb.entries)) return null;
+            const s = cb.entries.find((e) => e && e.comment && String(e.comment).includes('可购买衣物库'));
+            return s ? { content: s.content || '', name: '角色世界书' } : null;
+        };
+        const inServerBook = async (bookName) => {
+            if (!bookName) return null;
+            const r = await serverGetBook(bookName);
+            if (!r.ok) return null;
+            const s = findEntryByComment(r.book, '可购买衣物库');
+            return s ? { content: s.content || '', name: bookName } : null;
+        };
+        const inMemoryWorldLists = () => {
+            let list = null;
+            try {
+                if (context && context.settings && Array.isArray(context.settings.world_info)) list = context.settings.world_info;
+                else if (Array.isArray(window.world_info)) list = window.world_info;
+            } catch (e) { list = null; }
+            if (!Array.isArray(list)) return null;
+            for (const book of list) {
+                if (!book || !Array.isArray(book.entries)) continue;
+                const s = book.entries.find((e) => e && e.comment && String(e.comment).includes('可购买衣物库'));
+                if (s) return { content: s.content || '', name: book.name || '全局世界书' };
+            }
+            return null;
+        };
+        // 服务器上找含「可购买衣物库」的书（全量扫兜底，读全局书用）
+        const scanServer = async () => {
+            const bn = await resolveServerBookName(role && role.name ? role.name : '');
+            if (!bn) return null;
+            return await inServerBook(bn);
+        };
+
+        if (effective === 'replace-honeymoon') {
+            let r = (role && role.char) ? inCharBook(role.char) : null;
+            if (!r) r = await scanServer();
+            if (r) return { content: r.content, name: r.name, mode: effective, found: true };
+            return { content: '', name: '', mode: effective, found: false, err: '角色专属书里没找到「可购买衣物库」条目' };
+        }
+        // global
+        let r = inMemoryWorldLists();
+        if (!r) r = await scanServer();
+        if (r) return { content: r.content, name: r.name, mode: effective, found: true };
+        return { content: '', name: '', mode: effective, found: false, err: '全局书《暮蝶衣物库》未检测到（请在平台上导入，扩展只读不建）' };
+    }
+
+    // 已购库写哪：永远写当前角色自己的世界书（闸1：写目标绑定当前聊天角色，换聊天跟着变）。
+    // 返回 { entry, cb, path, target }；entry 为本地角色世界书里的「已购衣物库」条目（没有则新建）。
+    function getWardrobeBook(role) {
+        if (!role || !role.char) return { entry: null, err: '未识别到当前聊天角色' };
+        const { cb, path } = ensureCharBook(role.char);
+        if (!cb || !Array.isArray(cb.entries)) {
+            return { entry: null, err: '当前角色无世界书结构且创建失败', noBook: true };
+        }
+        let entry = cb.entries.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
+        if (!entry) {
+            entry = buildNewPurchasedEntry(role.char, PURCHASED_TEMPLATE);
+            if (entry) log('创建「已购衣物库」条目（写入当前角色世界书）');
+        }
+        return { entry, cb, path, target: '当前角色世界书' };
+    }
+
+    // 照「已有衣物库/可购买衣物库」条目拷贝字段，新建「已购衣物库」条目。
+    // 克隆源字段：全局书用 key、代替蜜月用 keys（cloneKeyField 适配）；model 兜底：已有库 → 可购买库 → 默认字段。
+    function buildNewPurchasedEntry(char, template) {
+        const { cb } = ensureCharBook(char);
         if (!cb) return null;
         const model = cb.entries.find(
             (e) => e && e.comment && String(e.comment).includes('已有衣物库'),
-        );
+        ) || cb.entries.find(
+            (e) => e && e.comment && String(e.comment).includes('可购买衣物库'),
+        ) || null;
         const entry = {
             comment: '已购衣物库',
             content: template,
@@ -415,10 +592,8 @@
             enabled: true,
             position: 'after_char',
             use_regex: true,
-            // 同等地位：继承已有衣物库的触发关键词（换衣/穿着/整理行李等场景同样激活）
-            keys: (model && Array.isArray(model.keys) && model.keys.length)
-                ? JSON.parse(JSON.stringify(model.keys))
-                : ['已购', '衣物', '购买', '购入'],
+            // 同等地位：继承克隆源的触发关键词（换衣/穿着/整理行李等场景同样激活）
+            keys: cloneKeyField(model),
         };
         if (model) {
             // 拷贝其余字段，保证与酒馆世界书兼容
@@ -454,26 +629,12 @@
     }
 
     // 同步「已购衣物库」到平台活跃世界书（context.worldInfo）。
-    // 标准 SillyTavern 聊天激活的世界书条目数组，平台编辑器显示/保存的就是这份；
-    // 扩展改 data.character_book 不落盘时，这份是真正落盘的路径。返回 true 表示已写入。
+    // v1.7.0 守卫：只在数组【已含「已购衣物库」条目】时更新——已购库的首次创建永远发生在当前角色自己的
+    // 世界书（getWardrobeBook / 服务器 角色名_Worldbooks），绝不在此新建，防止把已购库写进全局书《暮蝶衣物库》。
     function syncToActiveWorld(context, content) {
         if (!context || !Array.isArray(context.worldInfo)) return false;
-        const hasShelf = context.worldInfo.some((e) => e && e.comment && String(e.comment).includes('可购买衣物库'));
-        if (!hasShelf) return false; // worldInfo 不是代替蜜月角色世界书，不动
-        let entry = context.worldInfo.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
-        if (!entry) {
-            // 仿照「已有衣物库」/「可购买衣物库」条目字段新建，然后 push 进 worldInfo
-            const fakeChar = { character_book: { entries: context.worldInfo } };
-            const built = buildNewPurchasedEntry(fakeChar, content);
-            if (!built) return false;
-            // world info 条目常见带 uid（编辑器/保存依赖），给个不冲突的值
-            let maxUid = -1;
-            for (const e of context.worldInfo) {
-                if (e && typeof e.uid === 'number' && e.uid > maxUid) maxUid = e.uid;
-            }
-            if (built.uid === undefined) built.uid = maxUid + 1;
-            entry = built;
-        }
+        const entry = context.worldInfo.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
+        if (!entry) return false; // 这本书没有已购库条目 → 不是扩展维护过的角色书/是全局书，不动
         entry.content = content;
         if (typeof context.saveWorldInfo === 'function') {
             try { context.saveWorldInfo(); } catch (e) { log('saveWorldInfo 失败：', e); }
@@ -490,21 +651,9 @@
         let touched = 0;
         const setEntry = (entriesArr) => {
             if (!Array.isArray(entriesArr)) return false;
-            const hasShelf = entriesArr.some((e) => e && e.comment && String(e.comment).includes('可购买衣物库'));
-            if (!hasShelf) return false; // 不是代替蜜月的角色世界书，不动
-            let entry = entriesArr.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
-            if (!entry) {
-                const fakeChar = { character_book: { entries: entriesArr } };
-                const built = buildNewPurchasedEntry(fakeChar, content);
-                if (!built) return false;
-                let maxUid = -1;
-                for (const e of entriesArr) {
-                    if (e && typeof e.uid === 'number' && e.uid > maxUid) maxUid = e.uid;
-                }
-                if (built.uid === undefined) built.uid = maxUid + 1;
-                entry = built;
-                entriesArr.push(entry);
-            }
+            // v1.7.0 守卫：只更新已含「已购衣物库」的书（首次创建在角色书里做，绝不污染全局书）
+            const entry = entriesArr.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
+            if (!entry) return false;
             entry.content = content;
             return true;
         };
@@ -550,7 +699,7 @@
             lastWatchKey = key;
             diag.pollHits++;
             diag.pollAdded = '';
-            handleMessages(newMsgs, true);
+            handleMessages(newMsgs, true).catch(() => { /* 轮询静默 */ });
             if (diag.pollAdded) log('轮询捕获新消息并同步: ' + diag.pollAdded);
         } else if (c.chat.length < lastLen) {
             lastWatchKey = key; // 聊天被清空/切换，重置基线
@@ -566,32 +715,60 @@
         }
     }
 
-    function handleMessages(messages, fromPoll) {
+    // 旧格式迁移：把 v1.6.x 全文式已购库重建为索引式（从货架提取款式名，逐行登记索引）。
+    // 货架读不到（全局书未导入等）时返回 null，上层保留旧 content 不清除（宁可保留也不丢数据）。
+    async function migrateToIndexFormat(role, ids) {
+        try {
+            const context = getContext();
+            const shelf = await getShelfSource(context, role);
+            if (!shelf.found) return null;
+            const titles = parseShelfTitles(shelf.content);
+            let content = PURCHASED_TEMPLATE;
+            for (const id of ids) {
+                const t = titles.find((x) => x.id === id);
+                if (!t) continue;
+                content = appendItem(content, t.cat, `${t.cat}【${t.id}】${t.title}`);
+            }
+            return content;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // 核心链路（v1.7.0）：
+    //   当前聊天角色 → 货架读取源(getShelfSource) → 已购库写入目标(getWardrobeBook，永远当前角色自己的世界书)
+    //   解析购买消息 → 登记一行索引（款式名+编号）→ 本地备份 → 同步角色书/服务器角色名_Worldbooks。
+    //   全局书只读不建；识别失败宁可空转不猜着写（闸1）。
+    async function handleMessages(messages, fromPoll) {
         if (!extensionEnabled) return; // 设置里关了总开关则跳过
         const context = getContext();
         if (!context) return;
-        const target = getTargetCharacter(context);
-        if (!target) return;
-        const { char, index } = target;
-        const { cb, path } = resolveCharBook(char);
-        if (!cb) return;
-        const entries = cb.entries;
-
-        const shelf = entries.find((e) => e.comment && e.comment.includes('可购买衣物库'));
-        if (!shelf) return; // 没有货架条目，静默返回
-        const shelfTitles = parseShelfTitles(shelf.content);
-
-        // 找到或创建「已购衣物库」条目（唯一操作对象）
-        let purchasedEntry = entries.find((e) => e.comment && e.comment.includes('已购衣物库'));
-        if (!purchasedEntry) {
-            purchasedEntry = buildNewPurchasedEntry(char, PURCHASED_TEMPLATE);
-            log('创建「已购衣物库」条目');
+        // 1) 当前聊天角色（闸1：写目标绑当前聊天角色，换聊天/切角色写目标跟着变）
+        const role = resolveCurrentChatRole(context);
+        if (!role || !role.char) {
+            if (!fromPoll) log('未识别当前聊天角色（' + (role && role.reason) + '），跳过本次同步');
+            return;
         }
-
-        let content = purchasedEntry.content || '';
-        // 已购编号记账集合：来自本地备份（唯一权威），防重复对账用；模型读不到（不进 content）
-        const b0 = backupFor(charNameKey(char));
-        let purchasedIds = (b0 && Array.isArray(b0.purchasedIds)) ? b0.purchasedIds.slice() : [];
+        // 2) 货架读取源
+        const shelf = await getShelfSource(context, role);
+        if (!shelf.found) {
+            // 全局书只读不建：检测不到就提示，绝不自动创建
+            if (!fromPoll) showToast('warning', '货架读取失败：' + (shelf.err || '未找到可购买衣物库'));
+            log('货架读取失败：' + (shelf.err || ''));
+            return;
+        }
+        const shelfTitles = parseShelfTitles(shelf.content);
+        // 3) 已购库写当前角色自己的世界书
+        const wb = getWardrobeBook(role);
+        if (!wb.entry) {
+            if (!fromPoll) showToast('warning', '已购库写入目标不可用：' + (wb.err || ''));
+            log('已购库写入目标不可用：' + (wb.err || ''));
+            return;
+        }
+        let content = wb.entry.content || '';
+        // 已购编号记账集合：来自本地备份（唯一权威），防重复对账用；模型读不到（独立记账层，不进 content 编号以外的部分）
+        const b = backupFor(role);
+        let purchasedIds = (b && Array.isArray(b.purchasedIds)) ? b.purchasedIds.slice() : [];
         let changed = false;
         const added = [];
 
@@ -599,23 +776,23 @@
             const mtext = msgText(msg);
             if (!mtext) continue;
             const buys = analyzeMessage(mtext, shelfTitles);
-            for (const b of buys) {
-                if (isAlreadyPurchased(purchasedIds, b.id)) {
-                    log(`跳过重复：${b.id}`);
+            for (const buy of buys) {
+                if (isAlreadyPurchased(purchasedIds, buy.id)) {
+                    log(`跳过重复：${buy.id}`);
                     continue;
                 }
-                const block = extractItemBlock(shelf.content, b.cat, b.num);
-                if (!block) {
-                    log(`在可购买库找不到 ${b.id} 的完整设定，跳过`);
+                // v1.7.0：已购库只登记一行索引（款式名+编号），全文权威在可购买库，绝不复制完整设定
+                const t = shelfTitles.find((x) => x.id === buy.id);
+                const title = t ? t.title : '';
+                if (!title) {
+                    log(`在可购买库找不到 ${buy.id} 的款式名，跳过`);
                     continue;
                 }
-                // 关键：剥离编号后再进已购库，角色/剧情永远看不到编号
-                const cleanBlock = stripItemIds(block);
-                if (!cleanBlock) continue;
-                content = appendItem(content, b.cat, cleanBlock);
-                purchasedIds.push(b.id);
+                const indexLine = `${buy.cat}【${buy.id}】${title}`;
+                content = appendItem(content, buy.cat, indexLine);
+                purchasedIds.push(buy.id);
                 changed = true;
-                added.push(`${b.id}(${b.by === 'title' ? '款式名' : '编号'})`);
+                added.push(`${buy.id}(${buy.by === 'title' ? '款式名' : '编号'})`);
             }
         }
 
@@ -626,32 +803,32 @@
             }
             return;
         }
-        purchasedEntry.content = content;
+        wb.entry.content = content;
 
         diag.lastAdded = added.join('、');
         diag.lastSyncAt = Date.now();
-        diag.charPath = path;
+        diag.charPath = wb.path || '';
         if (fromPoll) diag.pollAdded = added.join('、');
-        writeBackup(charNameKey(char), content, purchasedIds); // 无论平台是否落盘，本地备份先存
-        // 关键：同步到活跃世界书（context.worldInfo）——平台编辑器真正读写的存储
+        writeBackup(role, content, purchasedIds); // 无论平台是否落盘，本地备份先存
+        // 关键：同步到活跃世界书（守卫：只有已含已购库的书才更新，避免污染全局书）
         diag.wiSynced = syncToActiveWorld(context, content);
         if (diag.wiSynced) log('已同步进活跃世界书（context.worldInfo）');
         diag.editorSynced = syncToEditorState(context, content);
         if (diag.editorSynced) log('已同步进编辑器活动书（characterBook/settings.world_info）');
 
         // 保存：把所有候选保存接口全开火（谁真正落盘谁负责），不因单个成功短路。
-        if (!saveCharacterSafe(context, index, char)) {
+        if (!saveCharacterSafe(context, role.index, role.char)) {
             log('保存角色失败：找不到可用的保存接口（本地备份已存，下次加载自动恢复）');
             showToast('warning', '自动保存失败：已存本地备份，下次打开自动恢复已购库');
         } else {
             log(`已购衣物已同步：${added.join('、')}（已触发保存：${diag.lastSaveMethod}）`);
         }
 
-        // 真落盘：写入服务器世界书（云平台角色世界书即服务器书；本地无目标书自动跳过）。
+        // 真落盘：写入服务器世界书（当前角色自己的书：角色名_Worldbooks）。
         // fire-and-forget，不阻塞对话；结果进 diag，失败静默（本地备份兜底）。
-        // 这是"买了衣服却没进已购库"的根治：以前只写内存/空壳保存接口，服务器永远没收到。
+        // 全局书只读不建：写目标永远是当前角色自己的书，绝不写全局《暮蝶衣物库》。
         // openEditor=false：自动链路不把编辑台顶出来打断聊天，只刷新缓存/列表；编辑台开着这本书才会即时重绘。
-        syncServerPurchased(content, purchasedIds, false).then((r) => {
+        syncServerPurchased(content, purchasedIds, false, role).then((r) => {
             diag.serverWriteResult = r.lines.join('\n');
             if (r.ok) {
                 log('已购库已写入服务器世界书（' + added.join('、') + '）');
@@ -718,60 +895,64 @@
         try {
             const context = getContext();
             if (!context) { diag.loadReapply = 'getContext 不可用'; return false; }
-            const target = getTargetCharacter(context);
-            if (!target) { diag.loadReapply = '未找到目标角色'; return false; }
-            const { char } = target;
-            const { cb, path } = resolveCharBook(char);
-            if (!cb) { diag.loadReapply = '未找到世界书'; return false; }
-            diag.charPath = path;
-            const entries = cb.entries;
-            const existing = entries.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
-            const b = backupFor(charNameKey(char));
+            const role = resolveCurrentChatRole(context);
+            if (!role || !role.char) { diag.loadReapply = '未识别当前聊天角色（' + (role && role.reason) + '）'; return false; }
+            const wb = getWardrobeBook(role);
+            if (!wb.entry) {
+                diag.loadReapply = '当前角色无已购库写入目标（' + (wb.err || '') + '）——正常，尚未购买';
+                return true;
+            }
+            diag.charPath = wb.path || '';
+            const existing = wb.entry;
+            const b = backupFor(role);
             const backupIds = (b && Array.isArray(b.purchasedIds)) ? b.purchasedIds.slice() : [];
             const restoreContent = (c) => {
-                // 恢复动作：写内存 + 同步进活跃世界书/编辑器活动书 + 保存
+                // 恢复动作：写内存 + 同步进活跃世界书/编辑器活动书 + 保存（守卫：只有已含已购库的书才更新）
                 if (Array.isArray(context.worldInfo) &&
-                    context.worldInfo.some((e) => e && e.comment && String(e.comment).includes('可购买衣物库'))) {
+                    context.worldInfo.some((e) => e && e.comment && String(e.comment).includes('已购衣物库'))) {
                     diag.wiSynced = syncToActiveWorld(context, c) || diag.wiSynced;
                 }
                 diag.editorSynced = syncToEditorState(context, c) || diag.editorSynced;
-                saveCharacterSafe(context, target.index, char);
+                saveCharacterSafe(context, role.index, role.char);
             };
-            if (existing) {
-                // 旧格式迁移：条目 content 若含编号标记（旧版/预置卡遗留），剥离编号并收回记账集合
-                const legacyIds = (existing.content || '').match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g);
-                if (legacyIds && legacyIds.length) {
-                    const ids = legacyIds.map((x) => x.replace(/【|】/g, '').slice(0, 3));
-                    const merged = Array.from(new Set([...backupIds, ...ids]));
-                    existing.content = stripItemIds(existing.content);
-                    refreshBackup(charNameKey(char), existing.content, merged);
-                    diag.loadReapply = `迁移旧格式已购库（剥离编号，记账 ${merged.length} 款）`;
-                    restoreContent(existing.content);
+            // 旧格式迁移：全文式已购库（v1.6.x，含以【款式外观】/【实际结构】开头的完整设定段）→ 索引式。
+            // 判定用【行首段落】匹配，避免误伤 v1.7.0 索引式模板（模板【性质声明】里也含「实际结构」字样，但不在行首）。
+            // 提取编号从货架重建索引；货架读不到（全局书未导入等）则保留旧内容不清除（宁可保留也不丢数据）。
+            const isLegacyFull = !!(existing.content && /^【款式外观】|^【实际结构】|^【动态反应】/m.test(existing.content));
+            if (isLegacyFull) {
+                const legacyIds = [];
+                const mre = /【([泳睡日内礼])(\d{2})】/g;
+                let mm;
+                while ((mm = mre.exec(existing.content || '')) !== null) {
+                    legacyIds.push(mm[1] + mm[2]);
+                }
+                const ids = legacyIds;
+                const merged = Array.from(new Set([...backupIds, ...ids]));
+                if (merged.length) {
+                    diag.loadReapply = `检测到旧格式已购库（${merged.length} 款），异步迁移为索引式…`;
+                    migrateToIndexFormat(role, merged).then((newContent) => {
+                        if (newContent) {
+                            existing.content = newContent;
+                            writeBackup(role, newContent, merged);
+                            restoreContent(newContent);
+                            diag.loadReapply = `旧格式已购库已迁移为索引式（${merged.length} 款）`;
+                            log('旧格式已购库已迁移为索引式（' + merged.length + ' 款）');
+                        } else {
+                            diag.loadReapply = '旧格式已购库保留（货架不可用，未迁移，不丢数据）';
+                        }
+                    });
                     return true;
                 }
-                if (backupIds.length) {
-                    existing.content = b.content;
-                    diag.loadReapply = `从备份覆盖恢复已购衣物库（${backupIds.length} 款）`;
-                    restoreContent(existing.content);
-                    return true;
-                }
-                // 备份空：条目为空白模板，保持干净，只刷新备份
-                refreshBackup(charNameKey(char), existing.content, []);
-                diag.loadReapply = '内存已有已购衣物库（空白模板，无已购记录）';
+            }
+            if (backupIds.length) {
+                existing.content = b.content;
+                diag.loadReapply = `从备份覆盖恢复已购衣物库（${backupIds.length} 款）`;
+                restoreContent(existing.content);
                 return true;
             }
-            if (b && b.content) {
-                const entry = buildNewPurchasedEntry(char, b.content);
-                if (entry) {
-                    diag.loadReapply = `从本地备份恢复已购衣物库（${backupIds.length} 款）`;
-                    log('从本地备份恢复「已购衣物库」条目');
-                    restoreContent(entry.content);
-                    return true;
-                }
-                diag.loadReapply = '备份存在但重建条目失败';
-            } else {
-                diag.loadReapply = '无备份可恢复（正常，尚未购买）';
-            }
+            // 备份空：条目为空白模板，保持干净，只刷新备份
+            refreshBackup(role, existing.content, []);
+            diag.loadReapply = '内存已有已购衣物库（空白模板，无已购记录）';
             return true;
         } catch (e) {
             diag.loadReapply = '异常: ' + (e && e.message);
@@ -799,7 +980,7 @@
             text: msgText(m).slice(0, 100),
         }));
         try {
-            handleMessages(messages);
+            handleMessages(messages).catch((e) => { log('处理消息出错（已静默）：', e); });
         } catch (e) {
             log('处理消息出错（已静默）：', e);
         }
@@ -912,6 +1093,22 @@
             $writeServer.addEventListener('click', () => { writeServerWorldInfoNow(); });
         }
 
+        // 可购买库读取源：auto / replace-honeymoon / global（localStorage 持久化）
+        const $src = panel.querySelector('#sihs-shelf-source');
+        if ($src) {
+            $src.value = shelfSourceMode;
+            $src.addEventListener('change', () => {
+                shelfSourceMode = ($src.value === 'replace-honeymoon' || $src.value === 'global') ? $src.value : 'auto';
+                try { localStorage.setItem(STORAGE_KEY_SHELF_SOURCE, shelfSourceMode); } catch (e) { /* ignore */ }
+                resolvedBookName = ''; resolvedBookNameAt = 0; // 清缓存，下次重新定位
+                try {
+                    const label = $src.selectedOptions && $src.selectedOptions[0] ? $src.selectedOptions[0].text : shelfSourceMode;
+                    showToast('info', '货架读取源已切换：' + label);
+                } catch (e) { /* ignore */ }
+                updateSettingsStatus();
+            });
+        }
+
         // 服务器世界书名：读/写 localStorage；改了清掉缓存重新定位
         const $wbName = panel.querySelector('#sihs-worldbook-name');
         if ($wbName) {
@@ -919,6 +1116,7 @@
             $wbName.addEventListener('input', () => {
                 try { localStorage.setItem('standInHoneyMoonSync_worldbookName_v1', String($wbName.value || '').trim()); } catch (e) { /* ignore */ }
                 resolvedBookName = ''; resolvedBookNameAt = 0; // 清缓存，下次重新定位
+                updateSettingsStatus();
             });
         }
 
@@ -961,26 +1159,35 @@
         const panel = getSettingsPanel();
         if (!panel) return;
         const $disp = panel.querySelector('#sihs-status-display');
-        if (!$disp) return;
-        let text = '';
+        const $disp2 = panel.querySelector('#sihs-status-display-2');
         try {
             const context = getContext();
-            const target = getTargetCharacter(context);
-            if (!target) {
-                text = '未找到带「可购买衣物库」的角色（当前角色需是"代替蜜月"）。';
-            } else {
-                const { cb, path } = resolveCharBook(target.char);
-                const entries = (cb && cb.entries) || [];
-                const hasShelf = entries.some((e) => e && e.comment && String(e.comment).includes('可购买衣物库'));
-                const hasPurchased = entries.some((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
-                const b = backupFor(charNameKey(target.char));
-                const n = (b && Array.isArray(b.purchasedIds)) ? b.purchasedIds.length : 0;
-                text = `目标角色：${charNameKey(target.char) || '(无名)'}；已购衣物库：${hasPurchased ? '已创建' : '尚未创建'}（当前 ${n} 款）；世界书来源：${path || '未找到'}。`;
+            const role = context ? resolveCurrentChatRole(context) : null;
+            if (!role || !role.char) {
+                if ($disp) $disp.textContent = '当前聊天角色：未识别（' + ((role && role.reason) || 'getContext 不可用') + '）';
+                if ($disp2) $disp2.textContent = '已购库写入目标：未绑定（识别失败宁可空转不猜着写）';
+                return;
             }
+            const charName = role.name || '(无名)';
+            // 只读查询：不触发 getWardrobeBook（避免状态栏刷新时副作用创建空条目）
+            const { cb } = role.char ? resolveCharBook(role.char) : { cb: null };
+            const hasPurchased = !!(cb && cb.entries.some((e) => e && e.comment && String(e.comment).includes('已购衣物库')));
+            const b = backupFor(role);
+            const n = (b && Array.isArray(b.purchasedIds)) ? b.purchasedIds.length : 0;
+            const modeText = { auto: '自动(卡内货架→专属,否则→全局)', 'replace-honeymoon': '代替蜜月专属书', global: '全局书' }[shelfSourceMode] || shelfSourceMode;
+            if ($disp) $disp.textContent = `当前聊天角色：${charName}；货架源：${modeText}；已购衣物库：${hasPurchased ? '已就位' : '未创建'}（${n} 款）`;
+            // 闸2：手填服务器世界书名前缀 ≠ 当前角色名 → 黄条拦截提示
+            let warn = `已购库写入目标：${charName}_Worldbooks`;
+            try {
+                const manual = String(localStorage.getItem('standInHoneyMoonSync_worldbookName_v1') || '').trim();
+                if (manual && charName && !manual.startsWith(charName)) {
+                    warn = `⚠ 手填服务器世界书名「${manual}」前缀与当前角色「${charName}」不符，已拦截写入，请改成 <角色名>_Worldbooks`;
+                }
+            } catch (e) { /* ignore */ }
+            if ($disp2) $disp2.textContent = warn;
         } catch (e) {
-            text = '状态获取失败（不影响监听）。';
+            if ($disp) $disp.textContent = '状态获取失败（不影响监听）。';
         }
-        $disp.textContent = text;
     }
 
     function forceSyncNow() {
@@ -994,7 +1201,7 @@
             if (c && Array.isArray(c.chat)) messages = c.chat.slice(-5);
         } catch (e) { /* ignore */ }
         const before = diag.lastAdded;
-        handleMessages(messages);
+        handleMessages(messages).catch(() => { /* 已静默 */ });
         const after = diag.lastAdded;
         setTimeout(() => {
             updateSettingsStatus();
@@ -1009,9 +1216,9 @@
         try {
             const c = getContext();
             if (!c) { showToast('warning', 'getContext 不可用'); return; }
-            const t = getTargetCharacter(c);
-            if (!t) { showToast('warning', '未找到目标角色'); return; }
-            const ok = saveCharacterSafe(c, t.index, t.char);
+            const role = resolveCurrentChatRole(c);
+            if (!role || !role.char) { showToast('warning', '未识别当前聊天角色'); return; }
+            const ok = saveCharacterSafe(c, role.index, role.char);
             const called = diag.lastSaveMethod || '(无)';
             showToast(ok ? 'info' : 'warning', '已触发保存：' + called + (ok ? '' : '（未找到任何保存接口）'));
             setTimeout(updateSettingsStatus, 300);
@@ -1021,22 +1228,20 @@
         }
     }
 
-    // 写 worldInfo 落盘测试：把已购衣物库条目直接塞进 context.worldInfo（若为数组）再 saveWorldInfo 落盘。
-    // 平台自检显示 context 挂着真 saveWorldInfo 且抓包有 /api/worldinfo/edit → 试这条真落盘路。
-    // 同时把 worldInfo 的类型/是否数组/可否新建/是否含可购买库全打出来，不用控制台也能看。
+    // 写 worldInfo 落盘测试：把已购衣物库条目更新进 context.worldInfo（若为数组）再 saveWorldInfo 落盘。
+    // v1.7.0 守卫：只在 worldInfo【已含「已购衣物库」条目】时更新——已购库首次创建在角色书/服务器书里做，
+    // 绝不在这里新建，防止把已购库写进全局书《暮蝶衣物库》。
     function writeWorldInfoNow() {
         try {
             const c = getContext();
             if (!c) { showToast('warning', 'getContext 不可用'); return; }
-            const t = getTargetCharacter(c);
-            if (!t) { showToast('warning', '未找到目标角色'); return; }
+            const role = resolveCurrentChatRole(c);
+            if (!role || !role.char) { showToast('warning', '未识别当前聊天角色'); return; }
 
-            // 1) 找已购库 content（内存里的）
-            const { cb } = resolveCharBook(t.char);
-            if (!cb) { showToast('error', '目标角色无世界书 data.character_book'); return; }
-            const pur = cb.entries.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
-            if (!pur) { showToast('error', '内存里没有「已购衣物库」条目，先买一件或点立即同步'); return; }
-            const content = pur.content;
+            // 1) 找已购库 content（当前角色自己的世界书里的）
+            const wb = getWardrobeBook(role);
+            if (!wb.entry) { showToast('error', '当前角色没有「已购衣物库」条目（' + (wb.err || '') + '），先买一件或点立即同步'); return; }
+            const content = wb.entry.content || '';
 
             // 2) worldInfo 到底是啥
             const wiType = c.worldInfo === undefined ? 'undefined' : (Array.isArray(c.worldInfo) ? 'array' : typeof c.worldInfo);
@@ -1049,38 +1254,29 @@
             }
             if (Array.isArray(c.worldInfo)) {
                 lines.push('worldInfo 数组长度: ' + c.worldInfo.length);
-                const hasShelf = c.worldInfo.some((e) => e && e.comment && String(e.comment).includes('可购买衣物库'));
                 const hasPur = c.worldInfo.some((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
-                lines.push('worldInfo 含可购买库: ' + (hasShelf ? '是' : '否'));
                 lines.push('worldInfo 含已购库: ' + (hasPur ? '是' : '否'));
-                if (!hasShelf && !hasPur) {
-                    // worldInfo 不是代替蜜月的书 → 尝试按"通用书"写入？不，防御：提示别乱写别人的书
-                    lines.push('worldInfo 不含可购买库，不是代替蜜月的角色书 → 不写入，避免污染别的书');
+                if (!hasPur) {
+                    // 守卫：worldInfo 没有已购库条目 → 不是扩展维护过的角色书/是全局书，不新建、不写入
+                    lines.push('worldInfo 不含「已购衣物库」条目 → 不写入（已购库首次创建在角色书/服务器角色名_Worldbooks，避免污染全局书）');
                     writeWorldInfoResult(lines);
                     return;
                 }
             }
 
-            // 3) 塞进去
+            // 3) 塞进去（守卫：syncToActiveWorld 只更新已含已购库的书）
             let wrote = false;
             if (Array.isArray(c.worldInfo)) {
-                // 复用 syncToActiveWorld（写条目 + 调 saveWorldInfo）
                 wrote = syncToActiveWorld(c, content);
             } else if (c.worldInfo && typeof c.worldInfo === 'object') {
-                // 对象形态：找 entries / data
                 const arrCandidates = [c.worldInfo.entries, c.worldInfo.data, c.worldInfo.world_info];
                 for (const arr of arrCandidates) {
-                    if (Array.isArray(arr) && arr.some((e) => e && e.comment && String(e.comment).includes('可购买衣物库'))) {
-                        const fakeChar = { character_book: { entries: arr } };
-                        const built = buildNewPurchasedEntry(fakeChar, content);
-                        if (built) {
-                            arr.push(built);
-                            wrote = true;
-                            break;
-                        }
+                    if (Array.isArray(arr) && arr.some((e) => e && e.comment && String(e.comment).includes('已购衣物库'))) {
+                        const entry = arr.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
+                        if (entry) { entry.content = content; wrote = true; break; }
                     }
                 }
-                if (!wrote) lines.push('worldInfo 对象里找不到可购买库条目数组，未写入');
+                if (!wrote) lines.push('worldInfo 对象里没有含已购库的条目数组，未写入');
             }
             lines.push('写入 worldInfo: ' + (wrote ? '成功' : '未执行'));
 
@@ -1231,6 +1427,27 @@
         return null;
     }
 
+    // 已购库写入目标服务器书（v1.7.0）：永远当前角色自己的书（<角色名>_Worldbooks）。
+    // 闸2：手填书名前缀 ≠ 当前角色名 → 拦截（返回 blocked 原因，绝不写别人的书/全局书）。
+    // 返回 { book, blocked }；book 为服务器上实际存在的角色书，不存在则 book=null。
+    async function resolveWardrobeBookName(charName) {
+        let manual = '';
+        try { manual = String(localStorage.getItem('standInHoneyMoonSync_worldbookName_v1') || '').trim(); } catch (e) { /* ignore */ }
+        if (manual) {
+            if (charName && !manual.startsWith(charName)) {
+                return { book: null, blocked: '手填服务器世界书名「' + manual + '」前缀与当前角色「' + charName + '」不符，已拦截写入' };
+            }
+            const r = await serverGetBook(manual);
+            if (r.ok) return { book: manual, blocked: '' };
+            return { book: null, blocked: '手填服务器世界书「' + manual + '」在服务器上不存在' };
+        }
+        if (!charName) return { book: null, blocked: '未识别当前聊天角色' };
+        const auto = charName + '_Worldbooks';
+        const r = await serverGetBook(auto);
+        if (r.ok) return { book: auto, blocked: '' };
+        return { book: null, blocked: '服务器上无当前角色的世界书（' + auto + ' 不存在；已存本地备份，导出卡可转移）' };
+    }
+
     // 通知前端世界书缓存与编辑台刷新（让界面即时显示，不用手动刷新页面）。
     // Chloe 平台自己的保存会 worldInfoCache.set + emit WORLDINFO_UPDATED；
     // 扩展直接 POST edit 绕过了这步，这里补上：缓存更新 + 事件 + 编辑器重渲染，全防御式。
@@ -1264,42 +1481,41 @@
     }
 
     // 把「已购衣物库」content 写入服务器世界书（POST get → 改 entries → POST edit）。
-    // 与世界书编辑台同一套 API，直接连服务器书——老大说的"选世界书连上去"就这么实现。
+    // v1.7.0：写目标永远是当前角色自己的书（角色名_Worldbooks，闸2 前缀校验拦截），绝不写全局《暮蝶衣物库》；
+    // 已购库 content 为索引式（编号+款式名一行），回读验证用索引集合比对（比长度更稳）。
     // openEditor=true：写完把书载进编辑台（手动按钮，即时显示）；false/缺省：不打断聊天（自动链路）。
     // 返回 { ok, lines }；不弹 toast，结果进 diag，失败静默（本地备份兜底）。
-    async function syncServerPurchased(content, ids, openEditor) {
+    async function syncServerPurchased(content, ids, openEditor, role) {
         const lines = [];
         const n = Array.isArray(ids) ? ids.length : 0;
-        lines.push('已购库 content ' + (content ? content.length : 0) + ' 字（无编号），' + n + ' 款');
+        lines.push('已购库索引 ' + (content ? content.length : 0) + ' 字，' + n + ' 款');
         try {
             const context = getContext();
-            const target = context ? getTargetCharacter(context) : null;
-            const charName = target ? charNameKey(target.char) : '';
-            const bookName = await resolveServerBookName(charName);
-            if (!bookName) {
-                lines.push('服务器上没找到含「可购买衣物库」的世界书（本平台书名为 <角色名>_Worldbooks）');
+            const r = role || (context ? resolveCurrentChatRole(context) : null);
+            if (!r || !r.char) { lines.push('未识别当前聊天角色，跳过服务器写入'); return { ok: false, lines }; }
+            const charName = r.name || charNameKey(r.char);
+            const wb = await resolveWardrobeBookName(charName);
+            const bookName = wb.book;
+            if (wb.blocked || !bookName) {
+                lines.push(wb.blocked || '未定位到当前角色的服务器世界书');
                 return { ok: false, lines };
             }
             lines.push('目标服务器书: ' + bookName);
-            const r = await serverGetBook(bookName);
-            if (!r.ok) { lines.push('读书失败: ' + r.err); return { ok: false, lines }; }
-            const book = r.book;
+            const rg = await serverGetBook(bookName);
+            if (!rg.ok) { lines.push('读书失败: ' + rg.err); return { ok: false, lines }; }
+            const book = rg.book;
             const entries = entriesToMap(book.entries);
             const shelfE = findEntryByComment(book, '可购买衣物库');
-            if (!shelfE) { lines.push('书里没有「可购买衣物库」条目'); return { ok: false, lines }; }
             let pur = findEntryByComment(book, '已购衣物库');
             if (!pur) {
-                // 照可购买库条目克隆字段（保证与平台世界书格式一致），换 uid/comment/content
+                // 照可购买库条目克隆字段（cloneKeyField：全局书用 key、代替蜜月用 keys），换 uid/comment/content
                 const uid = nextFreeUid(book);
                 if (uid === null) { lines.push('分配 uid 失败'); return { ok: false, lines }; }
-                pur = Object.assign({}, shelfE, {
+                pur = Object.assign({}, shelfE || {}, {
                     uid,
                     comment: '已购衣物库',
                     content: content || '',
-                    // 同等地位：触发词照抄服务器上可购买库的（key 为世界书标准字段，兼容 keys 旧名）
-                    key: (Array.isArray(shelfE.key)
-                        ? JSON.parse(JSON.stringify(shelfE.key))
-                        : (Array.isArray(shelfE.keys) ? JSON.parse(JSON.stringify(shelfE.keys)) : ['已购', '衣物', '购买', '购入'])),
+                    key: cloneKeyField(shelfE),
                 });
                 entries[uid] = pur;
                 lines.push('新建「已购衣物库」条目 (uid=' + uid + ')');
@@ -1314,15 +1530,22 @@
             const refresh = await notifyWorldInfoRefreshed(bookName, book, openEditor);
             if (refresh.length) lines.push('已通知前端刷新: ' + refresh.join(' + '));
             else lines.push('（未找到前端刷新接口，编辑台如未更新需刷新页面）');
-            // 回读验证：已购库 content 不含编号（编号在记账层），用内容比对判断落盘
+            // 回读验证：索引集合比对（已购库索引行带编号，直接按编号集合判一致性）
             const v = await serverGetBook(bookName);
             if (v.ok) {
                 const vp = findEntryByComment(v.book, '已购衣物库');
                 if (vp) {
-                    const localLen = (content || '').length;
-                    const srvLen = (vp.content || '').length;
-                    lines.push('回读验证: 服务器「已购衣物库」' + (srvLen === localLen ? '与本地一致 ✓' : '长度不一致（服务器 ' + srvLen + ' / 本地 ' + localLen + '）'));
-                    return { ok: srvLen > 0, lines };
+                    const srvIds = (vp.content || '').match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) || [];
+                    const srvSet = new Set(srvIds.map((x) => x.replace(/【|】/g, '').slice(0, 3)));
+                    const localSet = new Set(Array.isArray(ids) ? ids : []);
+                    const missing = Array.from(localSet).filter((x) => !srvSet.has(x));
+                    const extra = Array.from(srvSet).filter((x) => !localSet.has(x));
+                    if (!missing.length && !extra.length) {
+                        lines.push('回读验证: 索引集合与本地一致 ✓（' + localSet.size + ' 款）');
+                        return { ok: localSet.size > 0, lines };
+                    }
+                    lines.push('回读验证: 集合不一致（本地缺 ' + (missing.length ? missing.join(',') : '(无)') + ' / 服务器多 ' + (extra.length ? extra.join(',') : '(无)') + '）');
+                    return { ok: false, lines };
                 }
                 lines.push('回读验证: 服务器上没有「已购衣物库」 ✗');
                 return { ok: false, lines };
@@ -1335,21 +1558,20 @@
         }
     }
 
-    // 按钮：把已购衣物库写到服务器世界书（手动兜底 + 验证）
+    // 按钮：把已购衣物库写到服务器世界书（手动兜底 + 验证）。写目标 = 当前角色自己的书（角色名_Worldbooks）。
     async function writeServerWorldInfoNow() {
         const lines = ['【已购库写入服务器世界书】'];
         try {
             const c = getContext();
-            const t = c ? getTargetCharacter(c) : null;
-            if (!t) { lines.push('未找到目标角色'); writeServerResult(lines); return; }
-            const { cb } = resolveCharBook(t.char);
-            const pur = cb && cb.entries.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
-            const b = backupFor(charNameKey(t.char));
-            const content = (b && b.content) || (pur && pur.content);
+            const role = c ? resolveCurrentChatRole(c) : null;
+            if (!role || !role.char) { lines.push('未识别当前聊天角色'); writeServerResult(lines); return; }
+            const wb = getWardrobeBook(role);
+            const b = backupFor(role);
+            const content = (b && b.content) || (wb.entry && wb.entry.content);
             if (!content) { lines.push('没有已购库内容（先买一件，或点立即同步）'); writeServerResult(lines); return; }
             const ids = (b && Array.isArray(b.purchasedIds)) ? b.purchasedIds : [];
             // openEditor=true：按钮场景，写完把书载进编辑台即时显示
-            const r = await syncServerPurchased(content, ids, true);
+            const r = await syncServerPurchased(content, ids, true, role);
             lines.push(...r.lines);
             if (!r.ok) lines.push('写入未完成——详见上方结果');
         } catch (e) {
@@ -1377,28 +1599,28 @@
         try {
             const c = getContext();
             if (!c) { showToast('warning', 'getContext 不可用'); return; }
-            const t = getTargetCharacter(c);
-            if (!t) { showToast('warning', '未找到目标角色'); return; }
-            const { cb } = resolveCharBook(t.char);
+            const role = resolveCurrentChatRole(c);
+            if (!role || !role.char) { showToast('warning', '未识别当前聊天角色'); return; }
+            const { cb } = ensureCharBook(role.char);
             if (!cb) { showToast('error', '目标角色无世界书 data.character_book'); return; }
             // 先把最近的聊天扫一遍（有购买则追加 + 写备份），保证导出的已购库是最新
             try {
                 const chat = Array.isArray(c.chat) ? c.chat.slice(-8) : [];
-                handleMessages(chat);
+                handleMessages(chat).catch(() => { /* 已静默 */ });
             } catch (e) { /* ignore */ }
             // 从备份刷新已购库 content（备份总是最新落点）
-            const b = backupFor(charNameKey(t.char));
+            const b = backupFor(role);
             if (b && b.content) {
                 const pur = cb.entries.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
                 if (pur) {
                     pur.content = b.content;
                 } else {
-                    const built = buildNewPurchasedEntry(t.char, b.content);
+                    const built = buildNewPurchasedEntry(role.char, b.content);
                     if (built) cb.entries.push(built);
                 }
             }
             // 拼 v3 卡壳
-            const data = (t.char.data && typeof t.char.data === 'object') ? t.char.data : t.char;
+            const data = (role.char.data && typeof role.char.data === 'object') ? role.char.data : role.char;
             data.character_book = cb;
             const card = { spec: 'chara_card_v3', spec_version: '2.0', data };
             const json = JSON.stringify(card, null, 2);
@@ -1408,7 +1630,7 @@
             let ts = '';
             try { ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19); } catch (e) { ts = 'card'; }
             a.href = url;
-            a.download = '代替蜜月_已购库' + ts + '.json';
+            a.download = (role.name || '角色') + '_已购库' + ts + '.json';
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
@@ -1586,40 +1808,46 @@
             lines.push('localStorage 含已购衣物库的键: ' + (localHits.length ? localHits.join(', ') : '(无)'));
 
             lines.push('[角色世界书]');
-            const target = c ? getTargetCharacter(c) : null;
-            if (!target) {
-                lines.push('目标角色: 未找到带「可购买衣物库」的角色');
+            const role = c ? resolveCurrentChatRole(c) : null;
+            if (!role || !role.char) {
+                lines.push('当前聊天角色: 未识别（' + ((role && role.reason) || 'getContext 不可用') + '）——宁可空转不猜着写');
             } else {
-                const { cb, path } = resolveCharBook(target.char);
-                diag.charPath = path;
-                const entries = (cb && cb.entries) || [];
-                lines.push('目标角色: ' + (target.char.name || (target.char.data && target.char.data.name) || '?'));
-                lines.push('目标角色下标: ' + target.index + '（characterId=' + c.characterId + '，' + (String(target.index) === String(c.characterId) ? '一致' : '不一致 ← 关注') + '）');
+                lines.push('当前聊天角色: ' + (role.name || '(无名)') + (role.fingerprint ? ('（指纹: ' + role.fingerprint + '）') : ''));
+                lines.push('角色下标: ' + role.index + '（characterId=' + c.characterId + '，' + (String(role.index) === String(c.characterId) ? '一致' : '不一致 ← 关注') + '）');
                 const idChar = ((typeof c.characterId === 'number' || typeof c.characterId === 'string') && Array.isArray(c.characters) && c.characters[Number(c.characterId)]) ? c.characters[Number(c.characterId)] : null;
                 lines.push('characterId 指向: ' + (idChar ? (idChar.name || (idChar.data && idChar.data.name) || '(无名)') : '(无)'));
-                if (idChar) {
-                    const idcb = resolveCharBook(idChar).cb;
-                    lines.push('characterId 角色含可购买库: ' + ((idcb && idcb.entries && idcb.entries.some((e) => e && String(e.comment || '').includes('可购买衣物库'))) ? '是' : '否'));
-                }
-                lines.push('来源路径: ' + (path || '未找到'));
+                lines.push('货架读取源模式: ' + shelfSourceMode + '（auto=当前角色卡内含「可购买衣物库」→专属书，否则→全局书）');
+                // 货架源（异步读：auto→角色书/全局书；全局书只读不建）
+                const shelfSrc = await getShelfSource(c, role);
+                lines.push('货架来源: ' + (shelfSrc.found
+                    ? ('「' + shelfSrc.name + '」(' + shelfSrc.mode + ') ' + (shelfSrc.content ? shelfSrc.content.length : 0) + ' 字')
+                    : ('未找到——' + (shelfSrc.err || ''))));
+                // 已购库写入目标（闸1：永远当前角色自己的世界书）
+                const wb = getWardrobeBook(role);
+                const wbPath = wb.path || '';
+                lines.push('已购库写入目标: ' + (wb.entry ? ('当前角色世界书（' + wbPath + '）已就位') : ('不可用（' + (wb.err || '') + '）')));
+                diag.charPath = wbPath;
+                const shelf = shelfSrc.found ? { content: shelfSrc.content } : null;
+                const entries = (wb.cb && wb.cb.entries) || [];
                 lines.push('entries 总数: ' + entries.length);
-                const shelf = entries.find((e) => e && e.comment && String(e.comment).includes('可购买衣物库'));
-                lines.push('可购买库: ' + (shelf ? '有（' + (shelf.content ? shelf.content.length : 0) + ' 字）' : '无'));
-                const pur = entries.find((e) => e && e.comment && String(e.comment).includes('已购衣物库'));
+                lines.push('可购买库(货架): ' + (shelf ? '有（' + (shelf.content ? shelf.content.length : 0) + ' 字）' : '无'));
+                const pur = wb.entry;
                 lines.push('已购衣物库(内存): ' + (pur ? '已创建（' + (pur.content ? pur.content.length : 0) + ' 字）' : '无'));
                 // 已购编号记账集合（来自本地备份，模型读不到）
-                const curBackup = backupFor(charNameKey(target.char));
+                const curBackup = backupFor(role);
                 const curIds = (curBackup && Array.isArray(curBackup.purchasedIds)) ? curBackup.purchasedIds : [];
                 lines.push('已购编号记账: ' + (curIds.length ? curIds.join('、') : '(空，从空开始)'));
                 if (pur && pur.content) {
                     lines.push('内存已购库含泳03(记账): ' + (curIds.includes('泳03') ? '是' : '否'));
                     lines.push('内存已购库款式数: ' + curIds.length);
-                    // 内容是否残留编号（v1.6.0 后应为否）
-                    const leftover = (pur.content.match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) || []).length;
-                    lines.push('已购库内容含编号标记: ' + (leftover ? leftover + ' 处 ⚠ 旧格式' : '否 ✓'));
+                    // 索引格式检查（v1.7.0 索引式：无行首【款式外观】等完整设定段；模板声明里的字样不算）
+                    const isIndex = !/^【款式外观】|^【实际结构】|^【动态反应】/m.test(pur.content);
+                    lines.push('已购库格式: ' + (isIndex ? '索引式 ✓' : '⚠ 旧全文格式（加载时自动迁移为索引式）'));
+                    const idxLines = (pur.content.match(/[泳睡日内礼]【[泳睡日内礼]\d{2}】/g) || []).length;
+                    lines.push('已购库索引行数: ' + idxLines);
                 }
 
-                // 购买链路测试：对当前可购买库跑一条标准购买消息
+                // 购买链路测试：对当前货架跑一条标准购买消息
                 if (shelf && shelf.content) {
                     lines.push('[购买链路测试]');
                     const titles = parseShelfTitles(shelf.content);
@@ -1627,8 +1855,8 @@
                     const sample = '我要买泳03';
                     const hits = analyzeMessage(sample, titles);
                     if (hits.length) {
-                        const b = extractItemBlock(shelf.content, hits[0].cat, hits[0].num);
-                        lines.push('发 "' + sample + '" → 命中 ' + hits[0].id + '，切块长度 ' + (b ? b.length : 0) + ' 字 → 会追加 ✓');
+                        const t0 = titles.find((x) => x.id === hits[0].id);
+                        lines.push('发 "' + sample + '" → 命中 ' + hits[0].id + '（' + (t0 ? t0.title : '?') + '）→ 会登记索引 ✓');
                     } else {
                         lines.push('发 "' + sample + '" → 未命中（可购买库或消息格式有变）✗');
                     }
@@ -1679,8 +1907,7 @@
             else { lines.push('  (无)'); }
 
             lines.push('[本地备份]');
-            const charName = target && target.char ? (target.char.name || (target.char.data && target.char.data.name)) : '';
-            const b = charName ? backupFor(charName) : null;
+            const b = (role && role.char) ? backupFor(role) : null;
             if (b) {
                 lines.push('备份含当前角色: 是');
                 lines.push('备份内容长度: ' + (b.content ? b.content.length : 0));
@@ -1694,9 +1921,9 @@
             // 服务器世界书扫描（异步，放最后，不阻塞前面）
             try {
                 lines.push('[服务器世界书]');
-                const charName = target && target.char ? charNameKey(target.char) : '';
+                const charName = (role && role.name) || '';
                 const bookName = await resolveServerBookName(charName);
-                lines.push('  定位到含「可购买衣物库」的书: ' + (bookName || '(未找到)'));
+                lines.push('  读源: 定位到含「可购买衣物库」的书: ' + (bookName || '(未找到)'));
                 if (bookName) {
                     const r = await serverGetBook(bookName);
                     if (r.ok) {
@@ -1712,6 +1939,11 @@
                     } else {
                         lines.push('  读书失败: ' + r.err);
                     }
+                }
+                // 写目标（当前角色自己的书，闸2 前缀校验）
+                if (role && role.char) {
+                    const wtarget = await resolveWardrobeBookName((role.name) || '');
+                    lines.push('  写目标: ' + (wtarget.book ? wtarget.book : ('无（' + (wtarget.blocked || '') + '）')));
                 }
                 const all = await serverWorldNames();
                 lines.push('  世界书列表(POST /api/settings/get): ' + (all.ok ? (all.names.length + ' 本: ' + all.names.join(', ')) : '失败 ' + all.err));
@@ -1748,21 +1980,23 @@
                 getDiag: async () => ({ diag, selfCheck: await runSelfCheck() }),
                 getBackup: () => loadBackup(),
                 forceSync: forceSyncNow,
+                // 调试：切换货架读取源（测试用；设置面板改动走 localStorage + 事件）
+                setShelfSource: (m) => { shelfSourceMode = (m === 'replace-honeymoon' || m === 'global') ? m : 'auto'; return shelfSourceMode; },
                 testSave: testSaveNow,
-                // 测试任意购买消息：返回命中+切块结果（不改任何数据）
-                testPurchase: (text) => {
+                // 测试任意购买消息：返回命中+索引行结果（不改任何数据）。货架按当前读取源（auto/专属/全局）解析。
+                testPurchase: async (text) => {
                     const c = getContext();
-                    const t = c ? getTargetCharacter(c) : null;
-                    if (!t) return '未找到目标角色';
-                    const { cb } = resolveCharBook(t.char);
-                    const shelf = cb && cb.entries.find((e) => e && e.comment && String(e.comment).includes('可购买衣物库'));
-                    if (!shelf) return '未找到可购买库';
+                    const role = c ? resolveCurrentChatRole(c) : null;
+                    if (!role || !role.char) return '未识别当前聊天角色';
+                    const shelf = await getShelfSource(c, role);
+                    if (!shelf.found) return '货架未找到：' + (shelf.err || '');
                     const titles = parseShelfTitles(shelf.content);
                     const hits = analyzeMessage(text || '', titles);
                     if (!hits.length) return '未命中（text=' + JSON.stringify(text) + '）';
                     return hits.map((h) => {
-                        const b = extractItemBlock(shelf.content, h.cat, h.num);
-                        return h.id + '(' + h.by + ') 切块' + (b ? b.length : 0) + '字';
+                        const t = titles.find((x) => x.id === h.id);
+                        const line = h.cat + '【' + h.id + '】' + (t ? t.title : '?');
+                        return h.id + '(' + h.by + ') 索引行: ' + line;
                     }).join('; ');
                 },
             };
@@ -1773,6 +2007,7 @@
         migrateBackupV2(); // 清旧 v1 备份（含编号+预置款式），从空开始
         installRequestHook(); // 先装保存请求拦截，越早越好
         loadExtensionEnabled();
+        loadShelfSource(); // 货架读取源（auto/replace-honeymoon/global）
         if (eventSource && event_types) {
             eventSource.on(event_types.MESSAGE_RECEIVED, function () {
                 diag.lastEventType = 'MESSAGE_RECEIVED';
@@ -1790,7 +2025,7 @@
                 eventSource.on(event_types.APP_READY, () => scheduleReapply());
             }
         }
-        log('扩展已加载，监听购买场景。');
+        log('扩展已加载，监听购买场景。（货架源：' + shelfSourceMode + '）');
         exposeDebug();
         startPolling(); // 轮询兜底：不依赖平台事件系统
         scheduleReapply(); // 页面加载后按重试节奏尝试恢复本地备份
