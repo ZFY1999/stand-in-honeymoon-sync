@@ -26,7 +26,7 @@
     // 已购库本地备份：云平台若保存不落盘，扩展每次加载从这恢复，保证模型能读到已购库
     const STORAGE_KEY_BACKUP = 'standInHoneyMoonSync_backup_v1';
     const SETTINGS_EXTENSION_NAME = 'stand-in-honeymoon-sync';
-    const SETTINGS_VERSION = '1.2.2';
+    const SETTINGS_VERSION = '1.2.3';
 
     // 诊断记录（设置面板自检显示，不需要 F12 控制台）
     const diag = {
@@ -448,7 +448,13 @@
             }
         }
 
-        if (!changed) return;
+        if (!changed) {
+            // 没新增款式也提示，方便确认"点同步"确实执行过（避免以为按钮没反应）
+            if (fromPoll) { /* 轮询静默 */ } else {
+                log('同步检查完成：无新增购买');
+            }
+            return;
+        }
         purchasedEntry.content = content;
 
         diag.lastAdded = added.join('、');
@@ -457,43 +463,36 @@
         if (fromPoll) diag.pollAdded = added.join('、');
         writeBackup(charNameKey(char), content); // 无论平台是否落盘，本地备份先存
 
-        // 保存：多路探测保存接口，任一路成功即可（云酒馆/fork 的 getContext 挂载不一致）。
-        // 优先标准 context.saveCharacterDebounced，其次全局 saveCharacterDebounced(index,char)。
+        // 保存：把所有候选保存接口全开火（谁真正落盘谁负责），不因单个成功短路。
         if (!saveCharacterSafe(context, index, char)) {
             log('保存角色失败：找不到可用的保存接口（本地备份已存，下次加载自动恢复）');
             showToast('warning', '自动保存失败：已存本地备份，下次打开自动恢复已购库');
         } else {
-            log(`已购衣物已同步：${added.join('、')}`);
+            log(`已购衣物已同步：${added.join('、')}（已触发保存：${diag.lastSaveMethod}）`);
         }
     }
 
-    // 多路保存：穷举 context / window / SillyTavern 上所有可能的保存接口，挨个试。
-    // 云平台把角色世界书作为独立 world info 存，所以 saveWorldInfo 最优先；
-    // 部分平台把 character_book 算角色元数据，saveMetadataDebounced 也试。
-    // 记录诊断：哪些接口存在、实际调到哪一路、是否抛错。
+    // 多路保存：云平台可能把角色数据存进不同子系统，且"调用不抛错"不代表"落盘了"。
+    // 策略：能调的全调（fire-and-forget），不短路——saveMetadata* 存角色 data（character_book 在里面），
+    // saveWorldInfo 存世界书系统，saveCharacter* 是标准酒馆接口，全部触发，谁真正落盘谁负责。
+    // 记录诊断：存在哪些接口、实际调了哪些、是否抛错。
     function saveCharacterSafe(context, index, char) {
         diag.lastSaveFound = [];
         diag.lastSaveError = '';
         const attempts = [];
-        // 1) 云平台最常见：角色世界书 = 独立 world info → context.saveWorldInfo()
-        if (context && typeof context.saveWorldInfo === 'function') {
-            attempts.push(['context.saveWorldInfo', () => context.saveWorldInfo()]);
-        }
-        // 2) context 上的角色保存方法（无参变体，保存当前角色）
-        const ctxKeys = ['saveCharacterDebounced', 'saveCharacter', 'saveCharacterCard', 'saveCharacterSettings'];
+        // 1) context 上所有候选保存方法（无参变体，保存当前角色/数据）
+        const ctxKeys = [
+            'saveMetadataDebounced', 'saveMetadata',       // 角色 data（character_book 所在）
+            'saveWorldInfo',                               // 平台世界书系统
+            'saveSettingsDebounced',                       // 平台设置（可能连带角色）
+            'saveCharacterDebounced', 'saveCharacter', 'saveCharacterCard', 'saveCharacterSettings',
+        ];
         for (const k of ctxKeys) {
             if (context && typeof context[k] === 'function') {
                 attempts.push(['context.' + k, () => context[k]()]);
             }
         }
-        // 3) 元数据保存（部分平台把 character_book 算角色元数据）
-        const metaKeys = ['saveMetadataDebounced', 'saveMetadata'];
-        for (const k of metaKeys) {
-            if (context && typeof context[k] === 'function') {
-                attempts.push(['context.' + k, () => context[k]()]);
-            }
-        }
-        // 4) window / SillyTavern 全局保存方法（带参：index, char）
+        // 2) window / SillyTavern 全局保存方法（带参：index, char）
         const globals = ['saveCharacterDebounced', 'saveCharacter', 'saveCharacterCard'];
         for (const k of globals) {
             const f1 = window.SillyTavern && typeof window.SillyTavern[k] === 'function' ? window.SillyTavern[k] : null;
@@ -502,18 +501,23 @@
             if (fn) attempts.push(['window.' + k, () => fn(index, char)]);
         }
         diag.lastSaveFound = attempts.map((a) => a[0]);
+        // 全部开火，逐个 try/catch，不因某个成功就跳过其余
+        const called = [];
         for (const [name, fn] of attempts) {
             try {
                 fn();
-                diag.lastSaveMethod = name;
-                diag.lastSaveAt = Date.now();
-                return true;
+                called.push(name);
             } catch (e) {
                 diag.lastSaveError = name + ': ' + (e && e.message);
             }
         }
+        if (called.length) {
+            diag.lastSaveMethod = called.join(' + ');
+            diag.lastSaveAt = Date.now();
+            return true;
+        }
         diag.lastSaveMethod = '';
-        return false; // 有候选但全抛错 → 由上层提示（本地备份兜底）
+        return false; // 一个候选都没有 → 由上层提示（本地备份兜底）
     }
 
     // 加载时恢复：若平台没把已购库持久化（常见于云酒馆），从本地备份重新注入内存，
@@ -683,6 +687,11 @@
             });
         }
 
+        const $testSave = panel.querySelector('#sihs-test-save');
+        if ($testSave) {
+            $testSave.addEventListener('click', testSaveNow);
+        }
+
         const $gh = panel.querySelector('#sihs-open-github');
         if ($gh) {
             $gh.addEventListener('click', () => {
@@ -730,8 +739,32 @@
             const c = getContext();
             if (c && Array.isArray(c.chat)) messages = c.chat.slice(-5);
         } catch (e) { /* ignore */ }
+        const before = diag.lastAdded;
         handleMessages(messages);
-        setTimeout(updateSettingsStatus, 300);
+        const after = diag.lastAdded;
+        setTimeout(() => {
+            updateSettingsStatus();
+            showToast(after !== before ? 'info' : 'info', after !== before
+                ? '已同步：' + after
+                : '同步完成：无新增购买（点上方"运行自检"看详情）');
+        }, 300);
+    }
+
+    // 测试保存：手动触发一次全量保存候选，报告哪些接口被调用（验证平台到底走哪条路落盘）
+    function testSaveNow() {
+        try {
+            const c = getContext();
+            if (!c) { showToast('warning', 'getContext 不可用'); return; }
+            const t = getTargetCharacter(c);
+            if (!t) { showToast('warning', '未找到目标角色'); return; }
+            const ok = saveCharacterSafe(c, t.index, t.char);
+            const called = diag.lastSaveMethod || '(无)';
+            showToast(ok ? 'info' : 'warning', '已触发保存：' + called + (ok ? '' : '（未找到任何保存接口）'));
+            setTimeout(updateSettingsStatus, 300);
+            log('测试保存：调用 ' + called + '；探测到 ' + diag.lastSaveFound.join(', '));
+        } catch (e) {
+            showToast('error', '测试保存异常：' + (e && e.message));
+        }
     }
 
     // --- 自检诊断（设置面板按钮，不需要 F12 控制台） ---
@@ -856,6 +889,7 @@
                 getDiag: () => ({ diag, selfCheck: runSelfCheck() }),
                 getBackup: () => loadBackup(),
                 forceSync: forceSyncNow,
+                testSave: testSaveNow,
                 // 测试任意购买消息：返回命中+切块结果（不改任何数据）
                 testPurchase: (text) => {
                     const c = getContext();
